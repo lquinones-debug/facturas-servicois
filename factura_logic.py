@@ -1,0 +1,133 @@
+"""factura_logic.py — Lógica pura del Control de Facturas (autocontenida).
+
+Copia recortada de tools/factura_lib.py SIN rutas locales ni lectura de JSON,
+para que la app pueda desplegarse en Streamlit Cloud (donde no existe C:\\Users\\...).
+
+Solo stdlib. Recibe filas (dicts) que vienen del Google Sheet y calcula estado
+de vencimiento y patrón de emisión. Mantener en sync con factura_lib.py.
+"""
+
+from __future__ import annotations
+
+import statistics
+from datetime import date, datetime, timedelta
+
+# Umbral de días para considerar una factura "por vencer" (amarillo)
+UMBRAL_POR_VENCER = 10
+# Estimación de emisión cuando el portal no la informa: emisión = vto - OFFSET
+OFFSET_EMISION_EST = 12
+# Ventana "recién emitida / disponible para descargar"
+VENTANA_ANTES = 3
+VENTANA_DESPUES = 5
+
+
+def parse_fecha(s):
+    """'dd/mm/aaaa' -> date, o None."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def fmt_fecha(d):
+    """date -> 'dd/mm/aaaa', o '' si None."""
+    return d.strftime("%d/%m/%Y") if d else ""
+
+
+def add_months(d, n):
+    """Suma n meses a una fecha, recortando el día al último día válido del mes destino."""
+    month = d.month - 1 + n
+    year = d.year + month // 12
+    month = month % 12 + 1
+    if month == 12:
+        last_day = 31
+    else:
+        last_day = (date(year, month + 1, 1) - date(year, month, 1)).days
+    return date(year, month, min(d.day, last_day))
+
+
+def preparar_factura(f):
+    """Agrega claves *_d (fechas parseadas) a un dict de factura del Sheet."""
+    f = dict(f)
+    f["emision_d"] = parse_fecha(f.get("fecha_emision"))
+    f["primer_vto_d"] = parse_fecha(f.get("primer_vto"))
+    f["segundo_vto_d"] = parse_fecha(f.get("segundo_vto"))
+    f["ref_d"] = f["emision_d"] or f["primer_vto_d"]
+    return f
+
+
+def clave_cuenta(f):
+    return (f.get("proveedor", ""), f.get("cuenta", ""), f.get("nro_cliente", ""))
+
+
+def agrupar_cuentas(facturas):
+    """Agrupa facturas (ya pasadas por preparar_factura) por cuenta y proyecta el próximo ciclo."""
+    grupos = {}
+    for f in facturas:
+        grupos.setdefault(clave_cuenta(f), []).append(f)
+
+    cuentas = []
+    for (prov, cuenta, nro), items in grupos.items():
+        items_ord = sorted(items, key=lambda x: x.get("ref_d") or date.min, reverse=True)
+        ultima = items_ord[0]
+
+        gaps = [(x["primer_vto_d"] - x["emision_d"]).days
+                for x in items if x.get("emision_d") and x.get("primer_vto_d")]
+        gap_tipico = int(statistics.median(gaps)) if gaps else None
+
+        if ultima.get("emision_d"):
+            prox_emision = add_months(ultima["emision_d"], 1)
+            prox_vto = prox_emision
+            if gap_tipico is not None:
+                prox_vto = prox_emision + timedelta(days=gap_tipico)
+        else:
+            prox_emision = None
+            prox_vto = add_months(ultima["primer_vto_d"], 1) if ultima.get("primer_vto_d") else None
+
+        cuentas.append({
+            "proveedor": prov,
+            "cuenta": cuenta,
+            "nro_cliente": nro,
+            "facturas": items_ord,
+            "ultima": ultima,
+            "gap_tipico": gap_tipico,
+            "prox_emision_est": prox_emision,
+            "prox_vto_est": prox_vto,
+            "nota": ultima.get("nota", ""),
+        })
+
+    cuentas.sort(key=lambda c: c["ultima"].get("primer_vto_d") or date.max)
+    return cuentas
+
+
+def estado_factura(vto, hoy, umbral=UMBRAL_POR_VENCER):
+    """Devuelve (codigo, etiqueta) del estado de un vencimiento respecto de hoy.
+
+    codigo ∈ {'vencida', 'por_vencer', 'al_dia', 'sin_dato'}.
+    """
+    if vto is None:
+        return ("sin_dato", "Sin vencimiento informado")
+    delta = (vto - hoy).days
+    if delta < 0:
+        return ("vencida", f"Venció hace {abs(delta)} día(s)")
+    if delta == 0:
+        return ("por_vencer", "¡Vence HOY!")
+    if delta <= umbral:
+        return ("por_vencer", f"Vence en {delta} día(s)")
+    return ("al_dia", f"Vence el {fmt_fecha(vto)}")
+
+
+# Emojis por estado, para usar en la UI
+EMOJI_ESTADO = {
+    "vencida": "🔴",
+    "por_vencer": "🟡",
+    "al_dia": "🟢",
+    "sin_dato": "⚪",
+}

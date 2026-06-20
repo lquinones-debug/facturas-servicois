@@ -1,0 +1,8 @@
+# NUNCA subir secretos
+.streamlit/secrets.toml
+*.json
+.env
+
+__pycache__/
+*.pyc
+.venv/
