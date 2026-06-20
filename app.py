@@ -156,7 +156,7 @@ def estado_venc(f):
 st.sidebar.title("🧾 Facturas de Servicios")
 seccion = st.sidebar.radio(
     "Sección",
-    ["📊 Consultar", "➕ Cargar factura", "💳 Pagos", "🏢 Proveedores"],
+    ["📊 Consultar", "📥 A descargar", "➕ Cargar factura", "💳 Pagos", "🏢 Proveedores"],
 )
 if st.sidebar.button("🔄 Actualizar datos"):
     _refrescar()
@@ -265,6 +265,65 @@ if seccion == "📊 Consultar":
         df_all.to_csv(index=False).encode("utf-8-sig"),
         file_name="facturas_servicios.csv", mime="text/csv",
     )
+
+
+# =============================================================================
+# A DESCARGAR (ayuda memoria de emisión)
+# =============================================================================
+elif seccion == "📥 A descargar":
+    st.header("📥 Ayuda memoria — facturas a buscar/descargar")
+    st.caption("Según la fecha típica de emisión de cada cuenta, te dice cuáles "
+               "**ya deberían tener una factura nueva emitida** (para ir a descargarla del portal).")
+
+    ref = st.date_input("Fecha de consulta", value=date.today(), format="DD/MM/YYYY")
+
+    prep = [fl.preparar_factura(f) for f in facturas]
+    cuentas = fl.agrupar_cuentas(prep)
+
+    disponibles, proximas = [], []
+    for c in cuentas:
+        r = fl.ayuda_memoria_descarga(c, ref)
+        if r["estado"] == "disponible":
+            disponibles.append((c, r))
+        elif r["estado"] == "proxima":
+            proximas.append((c, r))
+
+    disponibles.sort(key=lambda x: x[1]["emision_esperada"])
+    proximas.sort(key=lambda x: x[1]["emision_esperada"])
+
+    st.subheader(f"🟢 Ya deberían estar emitidas ({len(disponibles)}) — buscalas en el portal")
+    if not disponibles:
+        st.info("Por ahora no hay cuentas con factura nueva esperada para esta fecha.")
+    else:
+        filas = []
+        for c, r in disponibles:
+            filas.append({
+                "Proveedor": c["proveedor"],
+                "Cuenta": c["cuenta"],
+                "Nº Cliente": c["nro_cliente"],
+                "Emisión esperada": fl.fmt_fecha(r["emision_esperada"]),
+                "Base": "estimada" if r["estimada"] else "real",
+                "Última que tenemos": fl.fmt_fecha(r["ult_emision"]),
+            })
+        st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader(f"🔜 Próximas a emitir ({len(proximas)})")
+    if proximas:
+        filas = []
+        for c, r in proximas:
+            filas.append({
+                "Proveedor": c["proveedor"],
+                "Cuenta": c["cuenta"],
+                "Nº Cliente": c["nro_cliente"],
+                "Próx. emisión ~": fl.fmt_fecha(r["emision_esperada"]),
+                "Base": "estimada" if r["estimada"] else "real",
+            })
+        st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+
+    st.caption("ℹ️ Las cuentas marcadas como **estimada** (AySA, Aguas Cordobesas, Epec, etc.) "
+               "no informan fecha de emisión en el portal: se estima como vencimiento − 12 días. "
+               "Es orientativo.")
 
 
 # =============================================================================

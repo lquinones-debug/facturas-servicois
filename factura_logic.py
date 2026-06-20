@@ -131,3 +131,50 @@ EMOJI_ESTADO = {
     "al_dia": "🟢",
     "sin_dato": "⚪",
 }
+
+
+# ----- Ayuda memoria de EMISIÓN (qué facturas ya deberían estar emitidas) -----
+
+def emision_de_factura(f):
+    """Devuelve (fecha_emision, es_estimada). Si el portal no informa emisión,
+    se estima emisión = primer_vto - OFFSET_EMISION_EST."""
+    if f.get("emision_d"):
+        return f["emision_d"], False
+    if f.get("primer_vto_d"):
+        return f["primer_vto_d"] - timedelta(days=OFFSET_EMISION_EST), True
+    return None, True
+
+
+def ayuda_memoria_descarga(cuenta, ref):
+    """Para una cuenta (de agrupar_cuentas) y una fecha `ref`, dice si a esa fecha
+    ya debería haber una factura emitida MÁS NUEVA que la última que tenemos cargada.
+
+    Proyecta la emisión mes a mes desde la última emisión conocida (real o estimada)
+    y compara con la ventana [emisión - VENTANA_ANTES, ...].
+
+    Devuelve dict: estado 'disponible' | 'proxima' | 'sin_dato'.
+    """
+    ultima = cuenta["ultima"]
+    em_ult, estimada = emision_de_factura(ultima)
+    if not em_ult:
+        return {"estado": "sin_dato", "estimada": True, "ult_emision": None}
+
+    expected = em_ult
+    # avanzar mientras la ventana del próximo ciclo ya haya empezado a la fecha ref
+    while add_months(expected, 1) - timedelta(days=VENTANA_ANTES) <= ref:
+        expected = add_months(expected, 1)
+
+    if expected > em_ult:
+        return {
+            "estado": "disponible",
+            "emision_esperada": expected,
+            "dias_desde": (ref - expected).days,
+            "estimada": estimada,
+            "ult_emision": em_ult,
+        }
+    return {
+        "estado": "proxima",
+        "emision_esperada": add_months(em_ult, 1),
+        "estimada": estimada,
+        "ult_emision": em_ult,
+    }
