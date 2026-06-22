@@ -367,6 +367,54 @@ def set_url_adjunto(fid: str, columna: str, url: str) -> bool:
     return True
 
 
+# ----- Borrar filas -----------------------------------------------------------
+
+_sheet_gids: dict = {}
+
+
+def _sheet_id_por_titulo(titulo: str) -> int:
+    """gid numérico de una pestaña (lo pide la API para borrar filas). Cacheado."""
+    if titulo in _sheet_gids:
+        return _sheet_gids[titulo]
+    svc = _get_service()
+    meta = svc.spreadsheets().get(spreadsheetId=_sid()).execute()
+    for s in meta.get("sheets", []):
+        props = s["properties"]
+        _sheet_gids[props["title"]] = props["sheetId"]
+    if titulo not in _sheet_gids:
+        raise RuntimeError(f"No existe la pestaña {titulo!r}")
+    return _sheet_gids[titulo]
+
+
+def _borrar_fila(hoja_titulo: str, row_number: int) -> None:
+    """Elimina físicamente la fila row_number (1-indexada, como en A1) de la pestaña."""
+    svc = _get_service()
+    gid = _sheet_id_por_titulo(hoja_titulo)
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=_sid(),
+        body={"requests": [{"deleteDimension": {"range": {
+            "sheetId": gid, "dimension": "ROWS",
+            "startIndex": row_number - 1, "endIndex": row_number,
+        }}}]},
+    ).execute()
+    invalidar_cache()
+
+
+def borrar_factura(fid: str) -> bool:
+    """Elimina una factura por id. Devuelve False si no la encuentra."""
+    r = _buscar_fila_por_id(fid)
+    if not r:
+        return False
+    _borrar_fila(HOJA_FACTURAS, r["_row"])
+    return True
+
+
+def borrar_proveedor(row_number: int) -> bool:
+    """Elimina la fila de un proveedor (row sale de listar_proveedores -> '_row')."""
+    _borrar_fila(HOJA_PROVEEDORES, row_number)
+    return True
+
+
 # ----- Proveedores ------------------------------------------------------------
 
 def listar_proveedores(force_refresh: bool = False) -> list[dict]:

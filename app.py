@@ -29,16 +29,20 @@ st.set_page_config(page_title="Control de Facturas - Servicios", page_icon="🧾
 
 # ----- Acceso (clave única compartida) ---------------------------------------
 
-def _check_password() -> bool:
-    """Portón de contraseña. La clave sale de st.secrets['app_password']
-    (en la nube) o de la variable FACTURAS_APP_PASSWORD; por defecto 00000000."""
+def _clave_app() -> str:
+    """Clave compartida: st.secrets['app_password'] (nube) o FACTURAS_APP_PASSWORD;
+    por defecto 00000000. Se usa para entrar y para confirmar borrados."""
     import os
     try:
         clave = st.secrets.get("app_password")
     except Exception:
         clave = None
-    if not clave:
-        clave = os.getenv("FACTURAS_APP_PASSWORD", "00000000")
+    return str(clave or os.getenv("FACTURAS_APP_PASSWORD", "00000000"))
+
+
+def _check_password() -> bool:
+    """Portón de contraseña (clave compartida del equipo)."""
+    clave = _clave_app()
 
     if st.session_state.get("auth_ok"):
         return True
@@ -157,7 +161,8 @@ def estado_venc(f):
 st.sidebar.title("🧾 Facturas de Servicios")
 seccion = st.sidebar.radio(
     "Sección",
-    ["📊 Consultar", "📥 A descargar", "➕ Cargar factura", "💳 Pagos", "🏢 Proveedores"],
+    ["📊 Consultar", "📥 A descargar", "➕ Cargar factura", "💳 Pagos", "🏢 Proveedores",
+     "🗑️ Borrar / corregir"],
 )
 if st.sidebar.button("🔄 Actualizar datos"):
     _refrescar()
@@ -608,3 +613,97 @@ elif seccion == "🏢 Proveedores":
                 _refrescar()
                 st.success(f"Proveedor agregado ✅ ({proveedor} · {cuenta})")
                 st.rerun()
+
+
+# =============================================================================
+# BORRAR / CORREGIR
+# =============================================================================
+elif seccion == "🗑️ Borrar / corregir":
+    st.header("🗑️ Borrar registros")
+    st.info("Para **corregir** un dato no se edita: se **elimina** el registro y se "
+            "vuelve a cargar correcto (la factura en **➕ Cargar factura**, el proveedor "
+            "en **🏢 Proveedores**). Borrar pide la clave del equipo.")
+
+    if "del_ok_msg" in st.session_state:
+        st.success(st.session_state.pop("del_ok_msg"))
+
+    tab_f, tab_p = st.tabs(["Facturas", "Proveedores"])
+
+    # ---- Borrar factura
+    with tab_f:
+        q = st.text_input(
+            "Buscar la factura (proveedor, cuenta, nº cliente, comprobante o período)",
+            key="del_f_q",
+        )
+        cand = facturas
+        if q:
+            ql = q.lower()
+            cand = [f for f in facturas if any(
+                ql in str(f.get(k, "")).lower()
+                for k in ("proveedor", "cuenta", "nro_cliente", "comprobante", "periodo"))]
+        cand = sorted(cand, key=lambda x: fl.parse_fecha(x.get("primer_vto")) or date.max)
+
+        if not cand:
+            st.info("Sin resultados para esa búsqueda.")
+        else:
+            def _lbl_f(f):
+                return (f"{f.get('proveedor','')} · {f.get('cuenta','')} · "
+                        f"vto {f.get('primer_vto','')} · {fmt_money(f.get('monto_num'))} · "
+                        f"comp {f.get('comprobante','—')}  [{f['id']}]")
+
+            opciones = {"— Elegí una factura —": None}
+            for f in cand[:200]:
+                opciones[_lbl_f(f)] = f["id"]
+            sel = st.selectbox("Factura a eliminar", list(opciones.keys()), key="del_f_sel")
+            fid = opciones[sel]
+            if fid:
+                f = next((x for x in facturas if x["id"] == fid), None)
+                st.warning(
+                    f"Vas a **ELIMINAR** esta factura:\n\n"
+                    f"- **{f.get('proveedor','')} · {f.get('cuenta','')}**\n"
+                    f"- Vencimiento: {f.get('primer_vto','')} · Monto: {fmt_money(f.get('monto_num'))}\n"
+                    f"- Comprobante: {f.get('comprobante','—')} · Período: {f.get('periodo','—')}"
+                )
+                clave_f = st.text_input("Clave del equipo para confirmar", type="password",
+                                        key="del_f_pwd")
+                if st.button("🗑️ Eliminar factura", type="primary", key="del_f_btn"):
+                    if clave_f != _clave_app():
+                        st.error("Clave incorrecta. No se borró nada.")
+                    else:
+                        db.borrar_factura(fid)
+                        _refrescar()
+                        st.session_state["del_ok_msg"] = (
+                            "Factura eliminada. Si fue un error de carga, volvé a cargarla "
+                            "correcta en ➕ Cargar factura."
+                        )
+                        st.rerun()
+
+    # ---- Borrar proveedor
+    with tab_p:
+        if not proveedores:
+            st.info("No hay proveedores cargados.")
+        else:
+            opciones = {"— Elegí un proveedor —": None}
+            for p in proveedores:
+                lbl = f"{p.get('proveedor','')} · {p.get('cuenta','')}"
+                if p.get("nro_cliente"):
+                    lbl += f" · {p.get('nro_cliente')}"
+                opciones[lbl] = p.get("_row")
+            sel = st.selectbox("Proveedor a eliminar", list(opciones.keys()), key="del_p_sel")
+            row = opciones[sel]
+            if row:
+                st.warning(f"Vas a **ELIMINAR** el proveedor/cuenta: **{sel}**")
+                st.caption("No borra las facturas ya cargadas de ese proveedor, sólo la "
+                           "cuenta del listado de carga.")
+                clave_p = st.text_input("Clave del equipo para confirmar", type="password",
+                                        key="del_p_pwd")
+                if st.button("🗑️ Eliminar proveedor", type="primary", key="del_p_btn"):
+                    if clave_p != _clave_app():
+                        st.error("Clave incorrecta. No se borró nada.")
+                    else:
+                        db.borrar_proveedor(row)
+                        _refrescar()
+                        st.session_state["del_ok_msg"] = (
+                            "Proveedor eliminado. Si fue un error, volvé a cargarlo en 🏢 Proveedores."
+                        )
+                        st.rerun()
