@@ -21,6 +21,7 @@ import pandas as pd
 import streamlit as st
 
 import sheet_db as db
+import drive_db as drive
 import factura_logic as fl
 
 st.set_page_config(page_title="Control de Facturas - Servicios", page_icon="🧾", layout="wide")
@@ -209,6 +210,7 @@ if seccion == "📊 Consultar":
                     "Monto": fmt_money(f.get("monto_num")),
                     "Período": f.get("periodo", ""),
                     "Comprobante": f.get("comprobante", ""),
+                    "Factura": f.get("factura_url", ""),
                 })
             vencidas = sum(1 for f in pendientes if estado_venc(f)[0] == "vencida")
             por_vencer = sum(1 for f in pendientes if estado_venc(f)[0] == "por_vencer")
@@ -217,7 +219,11 @@ if seccion == "📊 Consultar":
             c2.metric("🔴 Vencidas", vencidas)
             c3.metric("🟡 Por vencer (≤10d)", por_vencer)
             st.caption(f"Total pendiente: **{fmt_money(total)}**")
-            st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(filas), use_container_width=True, hide_index=True,
+                column_config={"Factura": st.column_config.LinkColumn(
+                    "Factura", display_text="📄 ver")},
+            )
 
     # ---- Pagadas
     with tab_pag:
@@ -235,9 +241,17 @@ if seccion == "📊 Consultar":
                     "Pagó": f.get("pagado_por", ""),
                     "Comprobante": f.get("comprobante", ""),
                     "Período": f.get("periodo", ""),
+                    "Factura": f.get("factura_url", ""),
+                    "Comp. pago": f.get("comprobante_pago_url", ""),
                 })
             st.metric("Pagadas", len(pagadas))
-            st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(filas), use_container_width=True, hide_index=True,
+                column_config={
+                    "Factura": st.column_config.LinkColumn("Factura", display_text="📄 ver"),
+                    "Comp. pago": st.column_config.LinkColumn("Comp. pago", display_text="🧾 ver"),
+                },
+            )
 
     # ---- Histórico por período
     with tab_hist:
@@ -334,7 +348,8 @@ elif seccion == "➕ Cargar factura":
 
     # Limpiar campos de la carga anterior ANTES de instanciar los widgets
     if st.session_state.pop("cf_clear", False):
-        for k in ("cf_emision", "cf_vto", "cf_vto2", "cf_monto", "cf_comp", "cf_nota"):
+        for k in ("cf_emision", "cf_vto", "cf_vto2", "cf_monto", "cf_comp", "cf_nota",
+                  "cf_factura_file"):
             st.session_state.pop(k, None)
     if "cf_ok_msg" in st.session_state:
         st.success(st.session_state.pop("cf_ok_msg"))
@@ -343,6 +358,12 @@ elif seccion == "➕ Cargar factura":
     opciones = ["— Elegí proveedor —"] + nombres_prov + ["➕ Nuevo proveedor (cargar en 🏢 Proveedores)"]
 
     sel_prov = st.selectbox("Proveedor", opciones, key="cf_prov")
+
+    # Si cambió el proveedor, resetear la cuenta elegida (antes de instanciar el selectbox)
+    if st.session_state.get("cf_prov_prev") != sel_prov:
+        st.session_state.pop("cf_cuenta_idx", None)
+        st.session_state["cf_prov_prev"] = sel_prov
+
     proveedor = ""
     cuenta_val = ""
     nrocli_val = ""
@@ -358,10 +379,14 @@ elif seccion == "➕ Cargar factura":
             return cta
 
         etiquetas = [_etiqueta_cuenta(p) for p in cuentas_prov]
-        idx = st.selectbox("Cuenta", range(len(cuentas_prov)),
-                           format_func=lambda i: etiquetas[i],
-                           key="cf_cuenta_idx") if cuentas_prov else None
-        if idx is not None:
+        # Primera opción = placeholder vacío (-1): obliga a elegir la cuenta.
+        idx = st.selectbox(
+            "Cuenta",
+            [-1] + list(range(len(cuentas_prov))),
+            format_func=lambda i: "— Elegí la cuenta —" if i == -1 else etiquetas[i],
+            key="cf_cuenta_idx",
+        )
+        if idx is not None and idx >= 0:
             cuenta_val = cuentas_prov[idx].get("cuenta", "")
             nrocli_val = cuentas_prov[idx].get("nro_cliente", "")
     elif sel_prov.startswith("➕"):
@@ -389,6 +414,10 @@ elif seccion == "➕ Cargar factura":
         st.text_input("Período (automático)", value=periodo_val, disabled=True,
                       help="Mes anterior al 1er vencimiento. Se completa solo.")
     nota = st.text_input("Nota", key="cf_nota")
+    archivo_factura = st.file_uploader(
+        "📎 Adjuntar factura (PDF o imagen) — opcional",
+        type=["pdf", "jpg", "jpeg", "png"], key="cf_factura_file",
+    )
 
     if st.button("💾 Guardar factura", type="primary"):
         monto_val = parse_monto_ar(monto_str)
@@ -396,6 +425,8 @@ elif seccion == "➕ Cargar factura":
         faltan = []
         if not proveedor:
             faltan.append("Proveedor")
+        if not cuenta_val:
+            faltan.append("Cuenta")
         if emision is None:
             faltan.append("Fecha de emisión")
         if primer_vto is None:
@@ -412,6 +443,18 @@ elif seccion == "➕ Cargar factura":
                      "(se guarda como 00057 - 00089898).")
         else:
             periodo = periodo_auto(primer_vto)
+            factura_url = ""
+            if archivo_factura is not None:
+                try:
+                    with st.spinner("Subiendo la factura a Drive…"):
+                        factura_url = drive.subir_comprobante(
+                            archivo_factura.getvalue(), archivo_factura.name,
+                            archivo_factura.type,
+                            prefijo=f"{proveedor}_{cuenta_val}_{periodo}_factura",
+                        )
+                except Exception as e:  # noqa: BLE001
+                    st.warning("No pude subir el adjunto a Drive (la factura se guarda "
+                               f"igual; podés adjuntarlo después). Detalle: {e}")
             fid = db.append_factura({
                 "proveedor": proveedor,
                 "cuenta": cuenta_val,
@@ -425,6 +468,7 @@ elif seccion == "➕ Cargar factura":
                 "nota": nota,
                 "origen": "manual",
                 "estado_pago": db.ESTADO_PENDIENTE,
+                "factura_url": factura_url,
             })
             _refrescar()
             # Bandera para limpiar los campos en el próximo run (mantiene proveedor/cuenta)
@@ -476,15 +520,57 @@ elif seccion == "💳 Pagos":
             cols[1].markdown(f"Vto: **{f.get('primer_vto','')}**  \n{emoji} {et}")
             cols[2].markdown(f"Monto:  \n**{fmt_money(f.get('monto_num'))}**")
             with cols[3]:
+                fact_url = f.get("factura_url", "")
+                pago_url = f.get("comprobante_pago_url", "")
+                if fact_url:
+                    st.markdown(f"[📄 Factura]({fact_url})")
+                if pago_url:
+                    st.markdown(f"[🧾 Comprobante de pago]({pago_url})")
+
                 if pagada:
                     st.success(f"✅ Pagada {f.get('fecha_pago','')}")
+                    if not pago_url:
+                        comp_pago = st.file_uploader(
+                            "Adjuntar comprobante de pago",
+                            type=["pdf", "jpg", "jpeg", "png"], key=f"pago_file_{f['id']}",
+                        )
+                        if comp_pago is not None and st.button(
+                                "⬆️ Subir comprobante", key=f"uppago_{f['id']}"):
+                            try:
+                                with st.spinner("Subiendo comprobante…"):
+                                    url = drive.subir_comprobante(
+                                        comp_pago.getvalue(), comp_pago.name, comp_pago.type,
+                                        prefijo=f"{f.get('proveedor','')}_{f.get('cuenta','')}_pago",
+                                    )
+                                db.set_url_adjunto(f["id"], db.COL_COMPROBANTE_PAGO_URL, url)
+                                _refrescar()
+                                st.rerun()
+                            except Exception as e:  # noqa: BLE001
+                                st.warning(f"No pude subir el adjunto. Detalle: {e}")
                     if st.button("↩️ Revertir", key=f"rev_{f['id']}"):
                         db.marcar_pendiente(f["id"])
                         _refrescar()
                         st.rerun()
                 else:
+                    comp_pago = st.file_uploader(
+                        "Comprobante de pago — opcional",
+                        type=["pdf", "jpg", "jpeg", "png"], key=f"pago_file_{f['id']}",
+                    )
                     if st.button("✔️ Marcar pagada", key=f"pay_{f['id']}", type="primary"):
+                        url = ""
+                        if comp_pago is not None:
+                            try:
+                                with st.spinner("Subiendo comprobante…"):
+                                    url = drive.subir_comprobante(
+                                        comp_pago.getvalue(), comp_pago.name, comp_pago.type,
+                                        prefijo=f"{f.get('proveedor','')}_{f.get('cuenta','')}_pago",
+                                    )
+                            except Exception as e:  # noqa: BLE001
+                                st.warning("No pude subir el adjunto (igual marco pagada). "
+                                           f"Detalle: {e}")
                         db.marcar_pagada(f["id"], pagado_por=pagado_por.strip())
+                        if url:
+                            db.set_url_adjunto(f["id"], db.COL_COMPROBANTE_PAGO_URL, url)
                         _refrescar()
                         st.toast(f"Pagada: {f.get('proveedor','')} {f.get('cuenta','')}")
                         st.rerun()

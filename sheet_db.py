@@ -25,7 +25,11 @@ from pathlib import Path
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    # Drive: subir y compartir SOLO los archivos que crea la app (adjuntos).
+    "https://www.googleapis.com/auth/drive.file",
+]
 
 HOJA_FACTURAS = "Facturas"
 HOJA_PROVEEDORES = "Proveedores"
@@ -34,7 +38,13 @@ FACTURAS_HEADERS = [
     "id", "proveedor", "cuenta", "nro_cliente", "fecha_emision", "primer_vto",
     "segundo_vto", "monto", "periodo", "comprobante", "estado_pago",
     "fecha_pago", "pagado_por", "origen", "nota", "creado_ts",
+    # Adjuntos (links en Google Drive). Q = factura, R = comprobante de pago.
+    "factura_url", "comprobante_pago_url",
 ]
+# Última columna de Facturas (16→P pasó a 18→R al sumar los adjuntos).
+RANGO_FACTURAS = "A:R"
+COL_FACTURA_URL = "Q"
+COL_COMPROBANTE_PAGO_URL = "R"
 PROVEEDORES_HEADERS = ["proveedor", "cuenta", "nro_cliente", "trae_emision", "nota"]
 
 ESTADO_PENDIENTE = "Pendiente"
@@ -196,7 +206,7 @@ def listar_facturas(force_refresh: bool = False) -> list[dict]:
             return c["rows"]
         svc = _get_service()
         res = svc.spreadsheets().values().get(
-            spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!A:P",
+            spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{RANGO_FACTURAS}",
         ).execute()
         values = res.get("values", [])
         rows = _rows_to_dicts(values, FACTURAS_HEADERS) if values else []
@@ -244,9 +254,11 @@ def append_factura(factura: dict) -> str:
         factura.get("origen", "manual"),
         factura.get("nota", "") or "",
         factura.get("creado_ts") or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        factura.get("factura_url", "") or "",
+        factura.get("comprobante_pago_url", "") or "",
     ]
     svc.spreadsheets().values().append(
-        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!A:P",
+        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{RANGO_FACTURAS}",
         valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
         body={"values": [row]},
     ).execute()
@@ -275,9 +287,10 @@ def append_facturas_bulk(facturas: list[dict]) -> int:
             f.get("pagado_por", "") or "", f.get("origen", "pdf"),
             f.get("nota", "") or "",
             f.get("creado_ts") or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            f.get("factura_url", "") or "", f.get("comprobante_pago_url", "") or "",
         ])
     svc.spreadsheets().values().append(
-        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!A:P",
+        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{RANGO_FACTURAS}",
         valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
         body={"values": rows},
     ).execute()
@@ -327,6 +340,28 @@ def marcar_pendiente(fid: str) -> bool:
         spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!K{fila}:M{fila}",
         valueInputOption="USER_ENTERED",
         body={"values": [[ESTADO_PENDIENTE, "", ""]]},
+    ).execute()
+    invalidar_cache()
+    return True
+
+
+def set_url_adjunto(fid: str, columna: str, url: str) -> bool:
+    """Escribe el link de un adjunto en UNA sola celda de la factura.
+
+    columna = COL_FACTURA_URL ('Q') o COL_COMPROBANTE_PAGO_URL ('R').
+    No toca el resto de la fila (los rangos de marcar_pagada/pendiente son J:M / K:M).
+    """
+    if columna not in (COL_FACTURA_URL, COL_COMPROBANTE_PAGO_URL):
+        raise ValueError(f"columna inválida para adjunto: {columna!r}")
+    r = _buscar_fila_por_id(fid)
+    if not r:
+        return False
+    svc = _get_service()
+    fila = r["_row"]
+    svc.spreadsheets().values().update(
+        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{columna}{fila}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[url]]},
     ).execute()
     invalidar_cache()
     return True

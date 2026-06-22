@@ -61,6 +61,30 @@ Se abre en http://localhost:8501.
 > Service Account: `tiendabot-sheets@tiendabot-494700.iam.gserviceaccount.com`
 > (`crear_sheet.py` ya lo deja listo).
 
+## 4) Adjuntos (comprobantes en Cargar y Pagos)
+
+Los archivos (PDF/imagen de facturas y comprobantes de pago) se guardan en
+**Google Drive** y en el Sheet queda el link (columnas `factura_url` y
+`comprobante_pago_url`).
+
+Setup (una sola vez):
+1. En Drive → **Unidades compartidas** → crear una (ej. "Comprobantes Facturas").
+2. Agregar como miembro el email del Service Account
+   `tiendabot-sheets@tiendabot-494700.iam.gserviceaccount.com` con rol
+   **Administrador de contenido**.
+   > La cuenta de servicio **no tiene almacenamiento propio**: por eso el destino
+   > DEBE ser una Unidad Compartida (no una carpeta de "Mi unidad").
+3. Copiar el **ID** de la Unidad desde la URL y guardarlo en:
+   - Streamlit Cloud → Settings → Secrets: `drive_folder_id = "<ID>"`
+   - Local `.env`: `FACTURAS_DRIVE_FOLDER_ID=<ID>`
+4. Para que los encabezados nuevos existan en el Sheet, correr una vez
+   `python tools\migrar_headers_adjuntos.py` (o agregar a mano `factura_url` en
+   Q1 y `comprobante_pago_url` en R1 de la pestaña Facturas).
+
+Cada archivo subido queda como **"cualquiera con el link puede ver"**, así el
+equipo lo abre sin login de Google. Adjuntar es **opcional**: si no hay Unidad
+configurada, la app igual guarda/paga (sólo avisa que no pudo subir el adjunto).
+
 ## Notas
 
 - Google Sheets no es transaccional; para pocos usuarios alcanza. Hay un botón
