@@ -66,6 +66,13 @@ def _get_drive_service():
         return _drive
 
 
+def _reset_drive_service():
+    """Descarta el servicio cacheado (su conexión HTTP quedó muerta)."""
+    global _drive
+    with _drive_lock:
+        _drive = None
+
+
 def disponible() -> bool:
     """True si hay un destino de Drive configurado (para mensajes en la UI)."""
     try:
@@ -80,31 +87,65 @@ def _slug(s: str) -> str:
     return ("".join(keep).strip().replace(" ", "_")) or "x"
 
 
-def subir_comprobante(file_bytes: bytes, filename: str, mimetype: str | None = None,
-                      prefijo: str = "") -> str:
-    """Sube un archivo a la Unidad Compartida y devuelve su link (webViewLink).
+# Errores de red que justifican reintentar reconstruyendo la conexión: la SA
+# cachea una conexión HTTP que el servidor cierra tras un rato de inactividad, y
+# al reusarla la subida falla con "Broken pipe" / connection reset / etc.
+_ERRORES_RED = (
+    BrokenPipeError, ConnectionError, ConnectionResetError,
+    ConnectionAbortedError, TimeoutError, OSError,
+)
 
-    Queda compartido como "cualquiera con el link puede ver".
-    """
+
+def _intentar_subida(file_bytes: bytes, nombre: str, folder_id: str,
+                     mimetype: str | None) -> dict:
+    """Una pasada de subida + permiso. Reanudable, con reintentos internos."""
     svc = _get_drive_service()
-    folder_id = _resolver_folder_id()
-    nombre = f"{_slug(prefijo)}__{filename}" if prefijo else filename
     media = MediaIoBaseUpload(
         io.BytesIO(file_bytes),
         mimetype=mimetype or "application/octet-stream",
-        resumable=False,
+        resumable=True,  # sube por bloques y reintenta cada bloque
+        chunksize=5 * 1024 * 1024,
     )
-    archivo = svc.files().create(
+    req = svc.files().create(
         body={"name": nombre, "parents": [folder_id]},
         media_body=media,
         fields="id, webViewLink",
         supportsAllDrives=True,
-    ).execute()
+    )
+    archivo = None
+    while archivo is None:
+        _status, archivo = req.next_chunk(num_retries=3)
     fid = archivo["id"]
     # Compartir: cualquiera con el link puede ver.
     svc.permissions().create(
         fileId=fid,
         body={"type": "anyone", "role": "reader"},
         supportsAllDrives=True,
-    ).execute()
-    return archivo.get("webViewLink") or f"https://drive.google.com/file/d/{fid}/view"
+        fields="id",
+    ).execute(num_retries=3)
+    return archivo
+
+
+def subir_comprobante(file_bytes: bytes, filename: str, mimetype: str | None = None,
+                      prefijo: str = "") -> str:
+    """Sube un archivo a la Unidad Compartida y devuelve su link (webViewLink).
+
+    Queda compartido como "cualquiera con el link puede ver". Si la conexión
+    cacheada está muerta (Broken pipe), reconstruye el servicio y reintenta.
+    """
+    folder_id = _resolver_folder_id()
+    nombre = f"{_slug(prefijo)}__{filename}" if prefijo else filename
+
+    ultimo_error: Exception | None = None
+    for intento in range(3):
+        try:
+            archivo = _intentar_subida(file_bytes, nombre, folder_id, mimetype)
+            return (archivo.get("webViewLink")
+                    or f"https://drive.google.com/file/d/{archivo['id']}/view")
+        except _ERRORES_RED as e:  # conexión muerta → tirar el servicio y reintentar
+            ultimo_error = e
+            _reset_drive_service()
+    raise RuntimeError(
+        "No pude subir el archivo a Drive tras varios intentos "
+        f"(conexión inestable). Probá de nuevo. Detalle: {ultimo_error}"
+    )
