@@ -161,6 +161,39 @@ def estado_venc(f):
     return cod, et, fl.EMOJI_ESTADO.get(cod, "⚪")
 
 
+# Rubros (categoría del gasto). Lista fija + "Otros" (texto libre). Editable.
+RUBROS = ["Agua", "Alquiler", "Expensas", "Gas", "Internet", "Luz",
+          "Seguridad", "Tasa Municipal", "Telefonía", "Otros"]
+RUBRO_PLACEHOLDER = "(sin asignar)"
+RUBRO_OPCIONES = [RUBRO_PLACEHOLDER] + RUBROS
+
+
+def _input_rubro(key_prefix: str, actual: str = "") -> str:
+    """Menú desplegable de rubro (+ texto libre si es 'Otros'). Devuelve el rubro final."""
+    if actual in RUBROS:
+        idx = RUBRO_OPCIONES.index(actual)
+    elif actual:
+        idx = RUBRO_OPCIONES.index("Otros")
+    else:
+        idx = 0
+    sel = st.selectbox("Rubro", RUBRO_OPCIONES, index=idx, key=f"{key_prefix}_rubro")
+    if sel == "Otros":
+        custom = st.text_input("Especificá el rubro",
+                               value=(actual if actual not in RUBROS else ""),
+                               key=f"{key_prefix}_rubro_otro")
+        return custom.strip()
+    if sel == RUBRO_PLACEHOLDER:
+        return ""
+    return sel
+
+
+def fmt_monto_ar_num(v):
+    """Float -> string argentino sin '$' (para prellenar el campo monto al editar)."""
+    if v in (None, ""):
+        return ""
+    return fmt_money(v).replace("$", "").strip()
+
+
 # ----- Sidebar ----------------------------------------------------------------
 
 st.sidebar.title("🧾 Facturas de Servicios")
@@ -218,6 +251,7 @@ if seccion == "📊 Consultar":
                     "Nº Cliente": f.get("nro_cliente", ""),
                     "Vencimiento": f.get("primer_vto", ""),
                     "Monto": fmt_money(f.get("monto_num")),
+                    "Rubro": f.get("rubro", ""),
                     "Período": f.get("periodo", ""),
                     "Comprobante": f.get("comprobante", ""),
                     "Factura": f.get("factura_url", ""),
@@ -247,6 +281,7 @@ if seccion == "📊 Consultar":
                     "Cuenta": f.get("cuenta", ""),
                     "Vencimiento": f.get("primer_vto", ""),
                     "Monto": fmt_money(f.get("monto_num")),
+                    "Rubro": f.get("rubro", ""),
                     "Pagada el": f.get("fecha_pago", ""),
                     "Pagó": f.get("pagado_por", ""),
                     "Comprobante": f.get("comprobante", ""),
@@ -381,140 +416,246 @@ elif seccion == "📥 A descargar":
 # CARGAR FACTURA
 # =============================================================================
 elif seccion == "➕ Cargar factura":
-    st.header("➕ Cargar factura")
+    st.header("➕ Cargar / editar factura")
 
-    # Limpiar campos de la carga anterior ANTES de instanciar los widgets
-    if st.session_state.pop("cf_clear", False):
-        for k in ("cf_emision", "cf_vto", "cf_vto2", "cf_monto", "cf_comp", "cf_nota",
-                  "cf_factura_file"):
-            st.session_state.pop(k, None)
     if "cf_ok_msg" in st.session_state:
         st.success(st.session_state.pop("cf_ok_msg"))
+    if "cf_edit_ok_msg" in st.session_state:
+        st.success(st.session_state.pop("cf_edit_ok_msg"))
 
-    nombres_prov = sorted({p["proveedor"] for p in proveedores if p.get("proveedor")})
-    opciones = ["— Elegí proveedor —"] + nombres_prov + ["➕ Nuevo proveedor (cargar en 🏢 Proveedores)"]
+    # ---- Buscar una factura ya cargada para editarla (por N° de comprobante) ----
+    with st.expander("🔍 Buscar una factura ya cargada (por N° de comprobante) para editarla",
+                     expanded=bool(st.session_state.get("cf_edit_fid"))):
+        cb1, cb2 = st.columns([4, 1])
+        q_comp = cb1.text_input("N° de comprobante (o parte)", key="cf_busca_comp")
+        if cb2.button("🔍 Buscar", key="cf_busca_btn"):
+            qn = (q_comp or "").strip()
+            qn_fmt = formatear_comprobante(qn)
+            ql = qn.lower()
+            matches = []
+            if qn:
+                for f in facturas:
+                    comp = str(f.get("comprobante", ""))
+                    if (qn_fmt and comp == qn_fmt) or (ql and ql in comp.lower()):
+                        matches.append(f)
+            st.session_state["cf_edit_matches"] = [m["id"] for m in matches]
+            st.session_state["cf_edit_fid"] = matches[0]["id"] if len(matches) == 1 else None
+            st.session_state["cf_busca_hecha"] = True
 
-    sel_prov = st.selectbox("Proveedor", opciones, key="cf_prov")
+        match_ids = st.session_state.get("cf_edit_matches", [])
+        cand = [f for f in facturas if f["id"] in match_ids]
+        if len(cand) > 1:
+            op = {"— Elegí la factura —": None}
+            for f in cand:
+                op[(f"{f.get('proveedor','')} · {f.get('cuenta','')} · vto "
+                    f"{f.get('primer_vto','')} · {fmt_money(f.get('monto_num'))} · "
+                    f"comp {f.get('comprobante','—')}  [{f['id']}]")] = f["id"]
+            sel = st.selectbox("Resultados", list(op.keys()), key="cf_edit_sel")
+            if op[sel]:
+                st.session_state["cf_edit_fid"] = op[sel]
+        elif not cand and st.session_state.get("cf_busca_hecha"):
+            st.info("Sin resultados para ese comprobante.")
 
-    # Si cambió el proveedor, resetear la cuenta elegida (antes de instanciar el selectbox)
-    if st.session_state.get("cf_prov_prev") != sel_prov:
-        st.session_state.pop("cf_cuenta_idx", None)
-        st.session_state["cf_prov_prev"] = sel_prov
+    edit_fid = st.session_state.get("cf_edit_fid")
+    fe = next((x for x in facturas if x["id"] == edit_fid), None) if edit_fid else None
 
-    proveedor = ""
-    cuenta_val = ""
-    nrocli_val = ""
-    if sel_prov in nombres_prov:
-        proveedor = sel_prov
-        cuentas_prov = [p for p in proveedores if p.get("proveedor") == sel_prov]
+    # =========================================================================
+    # MODO EDICIÓN — corregir una factura existente (incluye asignar rubro)
+    # =========================================================================
+    if fe:
+        st.subheader(f"✏️ Editando: {fe.get('proveedor','')} · {fe.get('cuenta','')} "
+                     f"· comp {fe.get('comprobante','—')}")
+        st.caption(f"id {fe['id']} — se modifica en el lugar (no borra ni duplica).")
+        k = f"ed_{fe['id']}"
+        e1, e2 = st.columns(2)
+        with e1:
+            ed_prov = st.text_input("Proveedor", value=fe.get("proveedor", ""), key=f"{k}_prov")
+            ed_cuenta = st.text_input("Cuenta", value=fe.get("cuenta", ""), key=f"{k}_cuenta")
+            ed_nrocli = st.text_input("Nº Cliente", value=fe.get("nro_cliente", ""), key=f"{k}_nro")
+            ed_emision = st.date_input("Fecha de emisión",
+                                       value=fl.parse_fecha(fe.get("fecha_emision")),
+                                       format="DD/MM/YYYY", key=f"{k}_emision")
+            ed_vto = st.date_input("1er vencimiento", value=fl.parse_fecha(fe.get("primer_vto")),
+                                   format="DD/MM/YYYY", key=f"{k}_vto")
+        with e2:
+            ed_vto2 = st.date_input("2do vencimiento (opcional)",
+                                    value=fl.parse_fecha(fe.get("segundo_vto")),
+                                    format="DD/MM/YYYY", key=f"{k}_vto2")
+            ed_monto = st.text_input("Monto", value=fmt_monto_ar_num(fe.get("monto_num")),
+                                     key=f"{k}_monto")
+            ed_comp = st.text_input("N° de comprobante", value=fe.get("comprobante", ""),
+                                    key=f"{k}_comp")
+            ed_periodo = st.text_input("Período", value=fe.get("periodo", ""), key=f"{k}_periodo")
+        ed_rubro = _input_rubro(k, fe.get("rubro", ""))
+        ed_nota = st.text_input("Nota", value=fe.get("nota", ""), key=f"{k}_nota")
 
-        def _etiqueta_cuenta(p):
-            cta = p.get("cuenta", "")
-            nro = p.get("nro_cliente", "")
-            if nro and nro not in cta:
-                return f"{cta} · {nro}"
-            return cta
-
-        etiquetas = [_etiqueta_cuenta(p) for p in cuentas_prov]
-        # Primera opción = placeholder vacío (-1): obliga a elegir la cuenta.
-        idx = st.selectbox(
-            "Cuenta",
-            [-1] + list(range(len(cuentas_prov))),
-            format_func=lambda i: "— Elegí la cuenta —" if i == -1 else etiquetas[i],
-            key="cf_cuenta_idx",
-        )
-        if idx is not None and idx >= 0:
-            cuenta_val = cuentas_prov[idx].get("cuenta", "")
-            nrocli_val = cuentas_prov[idx].get("nro_cliente", "")
-    elif sel_prov.startswith("➕"):
-        st.info("Para un proveedor nuevo, primero cargalo en la sección **🏢 Proveedores** y volvé acá.")
-
-    # --- Campos (sin formulario: reaccionan al instante) ---
-    c1, c2 = st.columns(2)
-    with c1:
-        # Bloqueados: se autocompletan según la cuenta elegida
-        st.text_input("Cuenta", value=cuenta_val, disabled=True)
-        st.text_input("Nº Cliente", value=nrocli_val, disabled=True)
-        emision = st.date_input("Fecha de emisión *", value=None, format="DD/MM/YYYY", key="cf_emision")
-        primer_vto = st.date_input("1er vencimiento *", value=None, format="DD/MM/YYYY", key="cf_vto")
-    with c2:
-        segundo_vto = st.date_input("2do vencimiento (opcional)", value=None,
-                                    format="DD/MM/YYYY", key="cf_vto2")
-        monto_str = st.text_input("Monto *", placeholder="27.000,00", key="cf_monto",
-                                  on_change=_autoformatear_monto,
-                                  help="Formato argentino: '.' para miles y ',' para decimales.")
-        comprobante = st.text_input("N° de comprobante *", placeholder="67 - 8878", key="cf_comp",
-                                    on_change=_autoformatear_comp,
-                                    help="Se guarda como 00067 - 00008878 (5 + 8 dígitos).")
-        # Período: automático y bloqueado
-        periodo_val = periodo_auto(primer_vto) if primer_vto else ""
-        st.text_input("Período (automático)", value=periodo_val, disabled=True,
-                      help="Mes anterior al 1er vencimiento. Se completa solo.")
-    nota = st.text_input("Nota", key="cf_nota")
-    archivo_factura = st.file_uploader(
-        "📎 Adjuntar factura (PDF o imagen) — opcional",
-        type=["pdf", "jpg", "jpeg", "png"], key="cf_factura_file",
-    )
-
-    if st.button("💾 Guardar factura", type="primary"):
-        monto_val = parse_monto_ar(monto_str)
-        comp_fmt = formatear_comprobante(comprobante) if comprobante.strip() else None
-        faltan = []
-        if not proveedor:
-            faltan.append("Proveedor")
-        if not cuenta_val:
-            faltan.append("Cuenta")
-        if emision is None:
-            faltan.append("Fecha de emisión")
-        if primer_vto is None:
-            faltan.append("1er vencimiento")
-        if monto_val is None or monto_val <= 0:
-            faltan.append("Monto")
-        if not comprobante.strip():
-            faltan.append("N° de comprobante")
-
-        if faltan:
-            st.error("Faltan campos obligatorios: " + ", ".join(faltan))
-        elif comp_fmt is None:
-            st.error("El N° de comprobante debe tener dos números, ej: **67 - 8878** "
-                     "(se guarda como 00057 - 00089898).")
-        else:
-            periodo = periodo_auto(primer_vto)
-            factura_url = ""
-            if archivo_factura is not None:
-                try:
-                    with st.spinner("Subiendo la factura a Drive…"):
-                        factura_url = drive.subir_comprobante(
-                            archivo_factura.getvalue(), archivo_factura.name,
-                            archivo_factura.type,
-                            prefijo=f"{proveedor}_{cuenta_val}_{periodo}_factura",
-                        )
-                except Exception as e:  # noqa: BLE001
-                    st.warning("No pude subir el adjunto a Drive (la factura se guarda "
-                               f"igual; podés adjuntarlo después). Detalle: {e}")
-            fid = db.append_factura({
-                "proveedor": proveedor,
-                "cuenta": cuenta_val,
-                "nro_cliente": nrocli_val,
-                "fecha_emision": fl.fmt_fecha(emision),
-                "primer_vto": fl.fmt_fecha(primer_vto),
-                "segundo_vto": fl.fmt_fecha(segundo_vto) if segundo_vto else "",
-                "monto": monto_val,
-                "periodo": periodo,
-                "comprobante": comp_fmt,
-                "nota": nota,
-                "origen": "manual",
-                "estado_pago": db.ESTADO_PENDIENTE,
-                "factura_url": factura_url,
-            })
+        bcols = st.columns([1, 1, 4])
+        if bcols[0].button("💾 Guardar cambios", type="primary", key=f"{k}_save"):
+            monto_val = parse_monto_ar(ed_monto)
+            comp_fmt = formatear_comprobante(ed_comp) if ed_comp.strip() else ""
+            cambios = {
+                "proveedor": ed_prov.strip(),
+                "cuenta": ed_cuenta.strip(),
+                "nro_cliente": ed_nrocli.strip(),
+                "fecha_emision": fl.fmt_fecha(ed_emision) if ed_emision else "",
+                "primer_vto": fl.fmt_fecha(ed_vto) if ed_vto else "",
+                "segundo_vto": fl.fmt_fecha(ed_vto2) if ed_vto2 else "",
+                "monto": monto_val if monto_val is not None else "",
+                "periodo": ed_periodo.strip(),
+                "comprobante": comp_fmt or ed_comp.strip(),
+                "rubro": ed_rubro,
+                "nota": ed_nota.strip(),
+            }
+            db.actualizar_factura(fe["id"], cambios)
             _refrescar()
-            # Bandera para limpiar los campos en el próximo run (mantiene proveedor/cuenta)
-            st.session_state["cf_clear"] = True
-            st.session_state["cf_ok_msg"] = (
-                f"Factura guardada ✅ — comp. **{comp_fmt}**, período **{periodo}**, "
-                f"monto **{fmt_money(monto_val)}** (id {fid})"
+            for kk in ("cf_edit_fid", "cf_edit_matches", "cf_busca_hecha"):
+                st.session_state.pop(kk, None)
+            st.session_state["cf_edit_ok_msg"] = (
+                f"Cambios guardados ✅ — {ed_prov.strip()} · {ed_cuenta.strip()} "
+                f"(rubro: {ed_rubro or '—'})"
             )
             st.rerun()
+        if bcols[1].button("✖️ Cancelar / cargar nueva", key=f"{k}_cancel"):
+            for kk in ("cf_edit_fid", "cf_edit_matches", "cf_busca_hecha"):
+                st.session_state.pop(kk, None)
+            st.rerun()
+
+    # =========================================================================
+    # MODO NUEVA — alta de factura
+    # =========================================================================
+    else:
+        # Limpiar campos de la carga anterior ANTES de instanciar los widgets
+        if st.session_state.pop("cf_clear", False):
+            for kk in ("cf_emision", "cf_vto", "cf_vto2", "cf_monto", "cf_comp", "cf_nota",
+                       "cf_factura_file", "cf_rubro", "cf_rubro_otro"):
+                st.session_state.pop(kk, None)
+
+        nombres_prov = sorted({p["proveedor"] for p in proveedores if p.get("proveedor")})
+        opciones = ["— Elegí proveedor —"] + nombres_prov + ["➕ Nuevo proveedor (cargar en 🏢 Proveedores)"]
+
+        sel_prov = st.selectbox("Proveedor", opciones, key="cf_prov")
+
+        # Si cambió el proveedor, resetear la cuenta elegida (antes de instanciar el selectbox)
+        if st.session_state.get("cf_prov_prev") != sel_prov:
+            st.session_state.pop("cf_cuenta_idx", None)
+            st.session_state["cf_prov_prev"] = sel_prov
+
+        proveedor = ""
+        cuenta_val = ""
+        nrocli_val = ""
+        if sel_prov in nombres_prov:
+            proveedor = sel_prov
+            cuentas_prov = [p for p in proveedores if p.get("proveedor") == sel_prov]
+
+            def _etiqueta_cuenta(p):
+                cta = p.get("cuenta", "")
+                nro = p.get("nro_cliente", "")
+                if nro and nro not in cta:
+                    return f"{cta} · {nro}"
+                return cta
+
+            etiquetas = [_etiqueta_cuenta(p) for p in cuentas_prov]
+            # Primera opción = placeholder vacío (-1): obliga a elegir la cuenta.
+            idx = st.selectbox(
+                "Cuenta",
+                [-1] + list(range(len(cuentas_prov))),
+                format_func=lambda i: "— Elegí la cuenta —" if i == -1 else etiquetas[i],
+                key="cf_cuenta_idx",
+            )
+            if idx is not None and idx >= 0:
+                cuenta_val = cuentas_prov[idx].get("cuenta", "")
+                nrocli_val = cuentas_prov[idx].get("nro_cliente", "")
+        elif sel_prov.startswith("➕"):
+            st.info("Para un proveedor nuevo, primero cargalo en la sección **🏢 Proveedores** y volvé acá.")
+
+        # --- Campos (sin formulario: reaccionan al instante) ---
+        c1, c2 = st.columns(2)
+        with c1:
+            # Bloqueados: se autocompletan según la cuenta elegida
+            st.text_input("Cuenta", value=cuenta_val, disabled=True)
+            st.text_input("Nº Cliente", value=nrocli_val, disabled=True)
+            emision = st.date_input("Fecha de emisión *", value=None, format="DD/MM/YYYY", key="cf_emision")
+            primer_vto = st.date_input("1er vencimiento *", value=None, format="DD/MM/YYYY", key="cf_vto")
+        with c2:
+            segundo_vto = st.date_input("2do vencimiento (opcional)", value=None,
+                                        format="DD/MM/YYYY", key="cf_vto2")
+            monto_str = st.text_input("Monto *", placeholder="27.000,00", key="cf_monto",
+                                      on_change=_autoformatear_monto,
+                                      help="Formato argentino: '.' para miles y ',' para decimales.")
+            comprobante = st.text_input("N° de comprobante *", placeholder="67 - 8878", key="cf_comp",
+                                        on_change=_autoformatear_comp,
+                                        help="Se guarda como 00067 - 00008878 (5 + 8 dígitos).")
+            # Período: automático y bloqueado
+            periodo_val = periodo_auto(primer_vto) if primer_vto else ""
+            st.text_input("Período (automático)", value=periodo_val, disabled=True,
+                          help="Mes anterior al 1er vencimiento. Se completa solo.")
+        rubro_val = _input_rubro("cf")
+        nota = st.text_input("Nota", key="cf_nota")
+        archivo_factura = st.file_uploader(
+            "📎 Adjuntar factura (PDF o imagen) — opcional",
+            type=["pdf", "jpg", "jpeg", "png"], key="cf_factura_file",
+        )
+
+        if st.button("💾 Guardar factura", type="primary"):
+            monto_val = parse_monto_ar(monto_str)
+            comp_fmt = formatear_comprobante(comprobante) if comprobante.strip() else None
+            faltan = []
+            if not proveedor:
+                faltan.append("Proveedor")
+            if not cuenta_val:
+                faltan.append("Cuenta")
+            if emision is None:
+                faltan.append("Fecha de emisión")
+            if primer_vto is None:
+                faltan.append("1er vencimiento")
+            if monto_val is None or monto_val <= 0:
+                faltan.append("Monto")
+            if not comprobante.strip():
+                faltan.append("N° de comprobante")
+
+            if faltan:
+                st.error("Faltan campos obligatorios: " + ", ".join(faltan))
+            elif comp_fmt is None:
+                st.error("El N° de comprobante debe tener dos números, ej: **67 - 8878** "
+                         "(se guarda como 00057 - 00089898).")
+            else:
+                periodo = periodo_auto(primer_vto)
+                factura_url = ""
+                if archivo_factura is not None:
+                    try:
+                        with st.spinner("Subiendo la factura a Drive…"):
+                            factura_url = drive.subir_comprobante(
+                                archivo_factura.getvalue(), archivo_factura.name,
+                                archivo_factura.type,
+                                prefijo=f"{proveedor}_{cuenta_val}_{periodo}_factura",
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        st.warning("No pude subir el adjunto a Drive (la factura se guarda "
+                                   f"igual; podés adjuntarlo después). Detalle: {e}")
+                fid = db.append_factura({
+                    "proveedor": proveedor,
+                    "cuenta": cuenta_val,
+                    "nro_cliente": nrocli_val,
+                    "fecha_emision": fl.fmt_fecha(emision),
+                    "primer_vto": fl.fmt_fecha(primer_vto),
+                    "segundo_vto": fl.fmt_fecha(segundo_vto) if segundo_vto else "",
+                    "monto": monto_val,
+                    "periodo": periodo,
+                    "comprobante": comp_fmt,
+                    "nota": nota,
+                    "origen": "manual",
+                    "estado_pago": db.ESTADO_PENDIENTE,
+                    "factura_url": factura_url,
+                    "rubro": rubro_val,
+                })
+                _refrescar()
+                # Bandera para limpiar los campos en el próximo run (mantiene proveedor/cuenta)
+                st.session_state["cf_clear"] = True
+                st.session_state["cf_ok_msg"] = (
+                    f"Factura guardada ✅ — comp. **{comp_fmt}**, período **{periodo}**, "
+                    f"monto **{fmt_money(monto_val)}**, rubro **{rubro_val or '—'}** (id {fid})"
+                )
+                st.rerun()
 
 
 # =============================================================================
@@ -563,6 +704,27 @@ elif seccion == "💳 Pagos":
                     st.markdown(f"[📄 Factura]({fact_url})")
                 if pago_url:
                     st.markdown(f"[🧾 Comprobante de pago]({pago_url})")
+
+                # Adjuntar la factura (PDF) a un registro ya cargado que no la tiene.
+                if not fact_url:
+                    fac_file = st.file_uploader(
+                        "Adjuntar la factura (PDF/imagen)",
+                        type=["pdf", "jpg", "jpeg", "png"], key=f"fac_file_{f['id']}",
+                    )
+                    if fac_file is not None and st.button(
+                            "⬆️ Subir factura", key=f"upfac_{f['id']}"):
+                        try:
+                            with st.spinner("Subiendo la factura a Drive…"):
+                                url = drive.subir_comprobante(
+                                    fac_file.getvalue(), fac_file.name, fac_file.type,
+                                    prefijo=f"{f.get('proveedor','')}_{f.get('cuenta','')}_"
+                                           f"{f.get('periodo','')}_factura",
+                                )
+                            db.set_url_adjunto(f["id"], db.COL_FACTURA_URL, url)
+                            _refrescar()
+                            st.rerun()
+                        except Exception as e:  # noqa: BLE001
+                            st.warning(f"No pude subir el adjunto. Detalle: {e}")
 
                 if pagada:
                     st.success(f"✅ Pagada {f.get('fecha_pago','')}")

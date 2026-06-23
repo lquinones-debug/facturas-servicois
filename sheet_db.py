@@ -41,11 +41,14 @@ FACTURAS_HEADERS = [
     "fecha_pago", "pagado_por", "origen", "nota", "creado_ts",
     # Adjuntos (links en Google Drive). Q = factura, R = comprobante de pago.
     "factura_url", "comprobante_pago_url",
+    # Categoría del gasto (carga manual desde menú). S.
+    "rubro",
 ]
-# Última columna de Facturas (16→P pasó a 18→R al sumar los adjuntos).
-RANGO_FACTURAS = "A:R"
+# Última columna de Facturas (16→P; 18→R al sumar adjuntos; 19→S al sumar rubro).
+RANGO_FACTURAS = "A:S"
 COL_FACTURA_URL = "Q"
 COL_COMPROBANTE_PAGO_URL = "R"
+COL_RUBRO = "S"
 PROVEEDORES_HEADERS = ["proveedor", "cuenta", "nro_cliente", "trae_emision", "nota"]
 # Marcadores de "ya descargué esta factura" (ayuda memoria, estado compartido).
 DESCARGAS_HEADERS = ["clave", "proveedor", "cuenta", "nro_cliente",
@@ -261,6 +264,7 @@ def append_factura(factura: dict) -> str:
         factura.get("creado_ts") or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         factura.get("factura_url", "") or "",
         factura.get("comprobante_pago_url", "") or "",
+        factura.get("rubro", "") or "",
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{RANGO_FACTURAS}",
@@ -293,6 +297,7 @@ def append_facturas_bulk(facturas: list[dict]) -> int:
             f.get("nota", "") or "",
             f.get("creado_ts") or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             f.get("factura_url", "") or "", f.get("comprobante_pago_url", "") or "",
+            f.get("rubro", "") or "",
         ])
     svc.spreadsheets().values().append(
         spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{RANGO_FACTURAS}",
@@ -367,6 +372,35 @@ def set_url_adjunto(fid: str, columna: str, url: str) -> bool:
         spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!{columna}{fila}",
         valueInputOption="USER_ENTERED",
         body={"values": [[url]]},
+    ).execute()
+    invalidar_cache()
+    return True
+
+
+def actualizar_factura(fid: str, cambios: dict) -> bool:
+    """Reescribe la fila completa (A:S) de una factura aplicando `cambios`.
+
+    Sólo pisa las columnas que vengan en `cambios`; el resto (id, creado_ts,
+    estado_pago, etc.) se preserva de lo que ya había. Edición en el lugar para
+    corregir datos / asignar rubro sin borrar y recargar.
+    """
+    r = _buscar_fila_por_id(fid)
+    if not r:
+        return False
+    svc = _get_service()
+    fila = r["_row"]
+    # Fila completa en el orden de FACTURAS_HEADERS: cambio si vino, si no lo de antes.
+    row = []
+    for h in FACTURAS_HEADERS:
+        if h in cambios:
+            v = cambios[h]
+        else:
+            v = r.get(h, "")
+        row.append("" if v is None else v)
+    svc.spreadsheets().values().update(
+        spreadsheetId=_sid(), range=f"{HOJA_FACTURAS}!A{fila}:{COL_RUBRO}{fila}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
     ).execute()
     invalidar_cache()
     return True
