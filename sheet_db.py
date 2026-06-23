@@ -33,6 +33,7 @@ SCOPES = [
 
 HOJA_FACTURAS = "Facturas"
 HOJA_PROVEEDORES = "Proveedores"
+HOJA_DESCARGAS = "Descargas"
 
 FACTURAS_HEADERS = [
     "id", "proveedor", "cuenta", "nro_cliente", "fecha_emision", "primer_vto",
@@ -46,6 +47,9 @@ RANGO_FACTURAS = "A:R"
 COL_FACTURA_URL = "Q"
 COL_COMPROBANTE_PAGO_URL = "R"
 PROVEEDORES_HEADERS = ["proveedor", "cuenta", "nro_cliente", "trae_emision", "nota"]
+# Marcadores de "ya descargué esta factura" (ayuda memoria, estado compartido).
+DESCARGAS_HEADERS = ["clave", "proveedor", "cuenta", "nro_cliente",
+                     "emision_esperada", "marcado_por", "marcado_ts"]
 
 ESTADO_PENDIENTE = "Pendiente"
 ESTADO_PAGADA = "Pagada"
@@ -188,7 +192,8 @@ def asegurar_estructura():
 
 # ----- Facturas ---------------------------------------------------------------
 
-_cache = {"facturas": {"ts": 0.0, "rows": []}, "proveedores": {"ts": 0.0, "rows": []}}
+_cache = {"facturas": {"ts": 0.0, "rows": []}, "proveedores": {"ts": 0.0, "rows": []},
+          "descargas": {"ts": 0.0, "rows": []}}
 _cache_lock = threading.Lock()
 
 
@@ -454,3 +459,76 @@ def append_proveedores_bulk(filas: list[list]) -> int:
     ).execute()
     invalidar_cache()
     return len(filas)
+
+
+# ----- Descargas (ayuda memoria: "ya la descargué") ---------------------------
+
+def _asegurar_hoja(titulo: str, headers: list) -> None:
+    """Crea la pestaña y sus encabezados si faltan. Idempotente."""
+    svc = _get_service()
+    sid = _sid()
+    meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
+    existentes = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if titulo not in existentes:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": titulo}}}]},
+        ).execute()
+        _sheet_gids.clear()
+    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{titulo}!1:1").execute()
+    if not got.get("values"):
+        svc.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{titulo}!A1",
+            valueInputOption="RAW", body={"values": [headers]},
+        ).execute()
+
+
+def listar_descargas(force_refresh: bool = False) -> list[dict]:
+    now = time.time()
+    with _cache_lock:
+        c = _cache["descargas"]
+        if not force_refresh and (now - c["ts"] < CACHE_TTL):
+            return c["rows"]
+        svc = _get_service()
+        try:
+            res = svc.spreadsheets().values().get(
+                spreadsheetId=_sid(), range=f"{HOJA_DESCARGAS}!A:G",
+            ).execute()
+            values = res.get("values", [])
+        except Exception:  # noqa: BLE001 — la pestaña puede no existir todavía
+            values = []
+        rows = _rows_to_dicts(values, DESCARGAS_HEADERS) if values else []
+        c.update({"ts": now, "rows": rows})
+        return rows
+
+
+def claves_descargadas(force_refresh: bool = False) -> set:
+    """Conjunto de claves ya marcadas como descargadas."""
+    return {r.get("clave") for r in listar_descargas(force_refresh) if r.get("clave")}
+
+
+def marcar_descarga(clave, proveedor, cuenta, nro_cliente, emision_esperada,
+                    marcado_por="") -> None:
+    """Marca una cuenta/período como ya descargado (estado compartido)."""
+    _asegurar_hoja(HOJA_DESCARGAS, DESCARGAS_HEADERS)
+    svc = _get_service()
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    svc.spreadsheets().values().append(
+        spreadsheetId=_sid(), range=f"{HOJA_DESCARGAS}!A:G",
+        valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+        body={"values": [[clave, proveedor, cuenta, nro_cliente,
+                          emision_esperada, marcado_por, ts]]},
+    ).execute()
+    invalidar_cache()
+
+
+def desmarcar_descarga(clave: str) -> bool:
+    """Borra el/los marcadores de descarga con esa clave (deshacer)."""
+    filas = [r["_row"] for r in listar_descargas(force_refresh=True)
+             if r.get("clave") == clave]
+    if not filas:
+        return False
+    for row in sorted(filas, reverse=True):  # de abajo hacia arriba
+        _borrar_fila(HOJA_DESCARGAS, row)
+    invalidar_cache()
+    return True

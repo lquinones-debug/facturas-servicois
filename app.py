@@ -80,6 +80,11 @@ def cargar_proveedores():
     return db.listar_proveedores(force_refresh=True)
 
 
+@st.cache_data(ttl=db.CACHE_TTL, show_spinner=False)
+def cargar_descargas():
+    return db.claves_descargadas(force_refresh=True)
+
+
 def fmt_money(v):
     if v in (None, ""):
         return ""
@@ -295,9 +300,15 @@ elif seccion == "📥 A descargar":
                "**ya deberían tener una factura nueva emitida** (para ir a descargarla del portal).")
 
     ref = st.date_input("Fecha de consulta", value=date.today(), format="DD/MM/YYYY")
+    nombre_dl = st.text_input("Tu nombre (opcional, queda registrado al marcar)", key="dl_nombre")
 
     prep = [fl.preparar_factura(f) for f in facturas]
     cuentas = fl.agrupar_cuentas(prep)
+    marcadas = cargar_descargas()
+
+    def _clave_dl(c, r):
+        return (f"{c['proveedor']}|{c['cuenta']}|{c['nro_cliente']}|"
+                f"{fl.fmt_fecha(r['emision_esperada'])}")
 
     disponibles, proximas = [], []
     for c in cuentas:
@@ -310,21 +321,42 @@ elif seccion == "📥 A descargar":
     disponibles.sort(key=lambda x: x[1]["emision_esperada"])
     proximas.sort(key=lambda x: x[1]["emision_esperada"])
 
-    st.subheader(f"🟢 Ya deberían estar emitidas ({len(disponibles)}) — buscalas en el portal")
-    if not disponibles:
-        st.info("Por ahora no hay cuentas con factura nueva esperada para esta fecha.")
+    pendientes = [(c, r) for c, r in disponibles if _clave_dl(c, r) not in marcadas]
+    ya_desc = [(c, r) for c, r in disponibles if _clave_dl(c, r) in marcadas]
+
+    st.subheader(f"🟢 Ya deberían estar emitidas ({len(pendientes)}) — buscalas en el portal")
+    if not pendientes:
+        st.success("No hay facturas nuevas para descargar por ahora. 🎉")
     else:
-        filas = []
-        for c, r in disponibles:
-            filas.append({
-                "Proveedor": c["proveedor"],
-                "Cuenta": c["cuenta"],
-                "Nº Cliente": c["nro_cliente"],
-                "Emisión esperada": fl.fmt_fecha(r["emision_esperada"]),
-                "Base": "estimada" if r["estimada"] else "real",
-                "Última que tenemos": fl.fmt_fecha(r["ult_emision"]),
-            })
-        st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+        for c, r in pendientes:
+            clave = _clave_dl(c, r)
+            with st.container(border=True):
+                cols = st.columns([4, 2, 3, 2])
+                cols[0].markdown(f"**{c['proveedor']}** · {c['cuenta']}")
+                cols[1].markdown(f"Nº {c['nro_cliente'] or '—'}")
+                cols[2].markdown(
+                    f"Emisión esperada: **{fl.fmt_fecha(r['emision_esperada'])}**  \n"
+                    f"({'estimada' if r['estimada'] else 'real'})"
+                )
+                if cols[3].button("✅ Ya la descargué", key=f"dl_{clave}", type="primary"):
+                    db.marcar_descarga(clave, c["proveedor"], c["cuenta"], c["nro_cliente"],
+                                       fl.fmt_fecha(r["emision_esperada"]), nombre_dl.strip())
+                    _refrescar()
+                    st.rerun()
+
+    if ya_desc:
+        with st.expander(f"✓ Ya descargadas este período ({len(ya_desc)})"):
+            for c, r in ya_desc:
+                clave = _clave_dl(c, r)
+                cc = st.columns([6, 2])
+                cc[0].markdown(f"{c['proveedor']} · {c['cuenta']} — emisión "
+                               f"{fl.fmt_fecha(r['emision_esperada'])}")
+                if cc[1].button("↩️ Deshacer", key=f"undl_{clave}"):
+                    db.desmarcar_descarga(clave)
+                    _refrescar()
+                    st.rerun()
+            st.caption("Cuando salga la factura del mes siguiente, la cuenta vuelve a "
+                       "aparecer sola arriba.")
 
     st.divider()
     st.subheader(f"🔜 Próximas a emitir ({len(proximas)})")
