@@ -194,6 +194,88 @@ def fmt_monto_ar_num(v):
     return fmt_money(v).replace("$", "").strip()
 
 
+# ----- Exportar a Excel (.xlsx) con tabla filtrable / segmentable --------------
+
+# Columnas legibles del export (orden = como se ven en el Excel)
+EXPORT_COLS = [
+    "Estado pago", "Estado venc.", "Proveedor", "Cuenta", "Nº Cliente", "Rubro",
+    "Período", "Emisión", "1er Vto", "2do Vto", "Monto", "Comprobante",
+    "Pagada el", "Pagó", "Origen", "Nota",
+]
+
+
+def df_export(facturas_list):
+    """DataFrame legible (columnas en español) para mostrar/segmentar/exportar."""
+    filas = []
+    for f in facturas_list:
+        _, et, _ = estado_venc(f)
+        filas.append({
+            "Estado pago": f.get("estado_pago", db.ESTADO_PENDIENTE),
+            "Estado venc.": et,
+            "Proveedor": f.get("proveedor", ""),
+            "Cuenta": f.get("cuenta", ""),
+            "Nº Cliente": f.get("nro_cliente", ""),
+            "Rubro": f.get("rubro", ""),
+            "Período": f.get("periodo", ""),
+            "Emisión": f.get("fecha_emision", ""),
+            "1er Vto": f.get("primer_vto", ""),
+            "2do Vto": f.get("segundo_vto", ""),
+            "Monto": f.get("monto_num") or 0.0,
+            "Comprobante": f.get("comprobante", ""),
+            "Pagada el": f.get("fecha_pago", ""),
+            "Pagó": f.get("pagado_por", ""),
+            "Origen": f.get("origen", ""),
+            "Nota": f.get("nota", ""),
+        })
+    return pd.DataFrame(filas, columns=EXPORT_COLS)
+
+
+def exportar_excel(facturas_list):
+    """Genera un .xlsx de la base como **Tabla de Excel** (autofiltro + listo para
+    agregar Segmentación de datos: en Excel → pestaña Insertar → Segmentación).
+    Devuelve los bytes del archivo."""
+    import io
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    df = df_export(facturas_list)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        df.to_excel(xl, index=False, sheet_name="Facturas")
+        ws = xl.sheets["Facturas"]
+
+        nfilas = len(df)
+        ncols = len(df.columns)
+        ref = f"A1:{get_column_letter(ncols)}{nfilas + 1}"
+
+        # Tabla de Excel: da el autofiltro y habilita Segmentación de datos (slicers)
+        if nfilas >= 1:
+            tabla = Table(displayName="Facturas", ref=ref)
+            tabla.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2", showRowStripes=True, showColumnStripes=False)
+            ws.add_table(tabla)
+
+        # Encabezado en negrita + congelar la primera fila
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="305496")
+            cell.alignment = Alignment(vertical="center")
+        ws.freeze_panes = "A2"
+
+        # Ancho de columnas según contenido
+        for i, col in enumerate(df.columns, start=1):
+            largos = [len(str(col))] + [len(str(v)) for v in df[col].tolist()]
+            ws.column_dimensions[get_column_letter(i)].width = min(max(largos) + 2, 42)
+
+        # Formato moneda en la columna Monto
+        col_monto = get_column_letter(EXPORT_COLS.index("Monto") + 1)
+        for r in range(2, nfilas + 2):
+            ws[f"{col_monto}{r}"].number_format = '#,##0.00'
+
+    return buf.getvalue()
+
+
 # ----- Sidebar ----------------------------------------------------------------
 
 st.sidebar.title("🧾 Facturas de Servicios")
@@ -226,12 +308,56 @@ st.sidebar.caption(f"{len(facturas)} facturas en la base")
 # =============================================================================
 if seccion == "📊 Consultar":
     st.header("📊 Consultar facturas")
+
+    # ---- Segmentación / filtros (se aplican a todas las pestañas y a la descarga) ----
+    with st.expander("🔎 Segmentar / filtrar", expanded=False):
+        f_provs = sorted({f.get("proveedor", "") for f in facturas if f.get("proveedor")})
+        f_rubros = sorted({f.get("rubro", "") for f in facturas if f.get("rubro")})
+        f_periodos = sorted({f.get("periodo", "") for f in facturas if f.get("periodo")}, reverse=True)
+        fc1, fc2, fc3 = st.columns(3)
+        sel_prov = fc1.multiselect("Proveedor", f_provs, key="flt_prov")
+        sel_rubro = fc2.multiselect("Rubro", f_rubros, key="flt_rubro")
+        sel_periodo = fc3.multiselect("Período", f_periodos, key="flt_periodo")
+        gc1, gc2 = st.columns([3, 2])
+        sel_texto = gc1.text_input(
+            "Buscar texto (cuenta, nº cliente, comprobante, nota)", key="flt_texto")
+        sel_estado = gc2.radio("Estado de pago", ["Todas", "Pendientes", "Pagadas"],
+                               horizontal=True, key="flt_estado")
+        if st.button("🧹 Limpiar filtros"):
+            for kk in ("flt_prov", "flt_rubro", "flt_periodo", "flt_texto", "flt_estado"):
+                st.session_state.pop(kk, None)
+            st.rerun()
+
+    def _pasa_filtro(f):
+        if sel_prov and f.get("proveedor") not in sel_prov:
+            return False
+        if sel_rubro and f.get("rubro") not in sel_rubro:
+            return False
+        if sel_periodo and f.get("periodo") not in sel_periodo:
+            return False
+        if sel_estado == "Pendientes" and f.get("estado_pago") == db.ESTADO_PAGADA:
+            return False
+        if sel_estado == "Pagadas" and f.get("estado_pago") != db.ESTADO_PAGADA:
+            return False
+        if sel_texto:
+            q = sel_texto.lower()
+            campos = [f.get(k, "") for k in
+                      ("proveedor", "cuenta", "nro_cliente", "comprobante", "nota", "periodo")]
+            if not any(q in str(v).lower() for v in campos):
+                return False
+        return True
+
+    facturas_f = [f for f in facturas if _pasa_filtro(f)]
+    hay_filtro = (sel_prov or sel_rubro or sel_periodo or sel_texto or sel_estado != "Todas")
+    if hay_filtro:
+        st.info(f"🔎 Filtro activo: **{len(facturas_f)}** de {len(facturas)} facturas.")
+
     tab_pend, tab_pag, tab_hist = st.tabs(
         ["⏳ Pendientes de pago", "✅ Pagadas", "📅 Histórico por período"]
     )
 
-    pendientes = [f for f in facturas if f.get("estado_pago", db.ESTADO_PENDIENTE) != db.ESTADO_PAGADA]
-    pagadas = [f for f in facturas if f.get("estado_pago") == db.ESTADO_PAGADA]
+    pendientes = [f for f in facturas_f if f.get("estado_pago", db.ESTADO_PENDIENTE) != db.ESTADO_PAGADA]
+    pagadas = [f for f in facturas_f if f.get("estado_pago") == db.ESTADO_PAGADA]
 
     # ---- Pendientes
     with tab_pend:
@@ -316,12 +442,23 @@ if seccion == "📊 Consultar":
             resumen["Total"] = resumen["Total"].apply(fmt_money)
             st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    # Exportar todo
+    # Exportar (respeta el filtro/segmentación activo)
     st.divider()
-    df_all = pd.DataFrame([{k: f.get(k, "") for k in db.FACTURAS_HEADERS} for f in facturas])
-    st.download_button(
-        "⬇️ Descargar base completa (CSV)",
-        df_all.to_csv(index=False).encode("utf-8-sig"),
+    cuales = "filtradas" if hay_filtro else "todas"
+    st.caption(f"Descarga **{len(facturas_f)}** facturas ({cuales}). El Excel viene como "
+               "**Tabla**: ya trae filtros por columna y podés agregar *Segmentación de datos* "
+               "(en Excel → pestaña **Insertar → Segmentación de datos**).")
+    dc1, dc2 = st.columns([2, 1])
+    dc1.download_button(
+        "⬇️ Descargar Excel (.xlsx)",
+        exportar_excel(facturas_f),
+        file_name="facturas_servicios.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    dc2.download_button(
+        "⬇️ CSV",
+        df_export(facturas_f).to_csv(index=False).encode("utf-8-sig"),
         file_name="facturas_servicios.csv", mime="text/csv",
     )
 
