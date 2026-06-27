@@ -9,8 +9,13 @@ de vencimiento y patrón de emisión. Mantener en sync con factura_lib.py.
 
 from __future__ import annotations
 
+import re
 import statistics
 from datetime import date, datetime, timedelta
+
+# Meses en español (índice 0 = Enero), para los desplegables de período.
+MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
 # Umbral de días para considerar una factura "por vencer" (amarillo)
 UMBRAL_POR_VENCER = 10
@@ -51,6 +56,61 @@ def add_months(d, n):
     else:
         last_day = (date(year, month + 1, 1) - date(year, month, 1)).days
     return date(year, month, min(d.day, last_day))
+
+
+# ----- PERÍODO (mes-año del consumo) -----------------------------------------
+# Formato canónico: "MM-YY" (ej. "05-26"). Se eligió año de 2 dígitos porque
+# Google Sheets convierte "MM-YYYY" en una fecha (lo guarda como nº de serie);
+# "MM-YY" lo respeta como texto. Ver migrar_periodos.py.
+
+def parse_periodo(s):
+    """Parsea un período en cualquier formato a (anio, mes), o None.
+
+    Acepta 'MM-YY', 'MM/YY', 'MM-YYYY', 'MM/YYYY' y 'YYYY-MM'. Año de 2 dígitos -> 20xx.
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{1,2})\s*[-/.]\s*(\d{2,4})$", s)  # MM-YY / MM/YYYY ...
+    if m:
+        mes, y = int(m.group(1)), int(m.group(2))
+        if y < 100:
+            y += 2000
+        if 1 <= mes <= 12:
+            return (y, mes)
+    m = re.match(r"^(\d{4})\s*[-/.]\s*(\d{1,2})$", s)  # YYYY-MM
+    if m:
+        y, mes = int(m.group(1)), int(m.group(2))
+        if 1 <= mes <= 12:
+            return (y, mes)
+    return None
+
+
+def fmt_periodo(anio, mes):
+    """(anio, mes) -> 'MM-YY' canónico (ej. (2026, 5) -> '05-26')."""
+    return f"{int(mes):02d}-{int(anio) % 100:02d}"
+
+
+def periodo_orden(anio, mes):
+    """(anio, mes) -> 'YYYY-MM' (clave para ordenar cronológicamente)."""
+    return f"{int(anio):04d}-{int(mes):02d}"
+
+
+def periodo_desde_vto(primer_vto):
+    """Período = mes ANTERIOR al 1er vencimiento -> (anio, mes)."""
+    prev = primer_vto.replace(day=1) - timedelta(days=1)
+    return (prev.year, prev.month)
+
+
+def periodo_canonico(f):
+    """Período canónico 'MM-YY' de una factura: usa el campo `periodo` si está;
+    si no, lo deriva del 1er vencimiento (mes anterior). '' si no se puede."""
+    pr = parse_periodo(f.get("periodo"))
+    if not pr:
+        vto = parse_fecha(f.get("primer_vto"))
+        if vto:
+            pr = periodo_desde_vto(vto)
+    return fmt_periodo(*pr) if pr else ""
 
 
 def preparar_factura(f):

@@ -164,47 +164,88 @@ def estado_venc(f):
 def periodo_par(f):
     """Devuelve (orden 'YYYY-MM', etiqueta 'MM-YY') del período de una factura.
 
-    Usa el campo `periodo` (MM-YY) si está; si no, lo deriva del 1er vencimiento.
+    Normaliza cualquier formato (MM-YY, MM/YYYY, etc.) vía factura_logic; si el
+    campo `periodo` está vacío, lo deriva del 1er vencimiento (mes anterior).
     """
-    p = (f.get("periodo") or "").strip()
-    m = re.match(r"(\d{1,2})-(\d{2})$", p)
-    if m:
-        return f"20{m.group(2)}-{int(m.group(1)):02d}", f"{int(m.group(1)):02d}-{m.group(2)}"
-    vto = fl.parse_fecha(f.get("primer_vto"))
-    if vto:
-        return vto.strftime("%Y-%m"), vto.strftime("%m-%y")
-    return "0000-00", "s/f"
+    pr = fl.parse_periodo(f.get("periodo"))
+    if not pr:
+        vto = fl.parse_fecha(f.get("primer_vto"))
+        if vto:
+            pr = fl.periodo_desde_vto(vto)
+    if not pr:
+        return ("0000-00", "s/f")
+    return (fl.periodo_orden(*pr), fl.fmt_periodo(*pr))
+
+
+def _sanear_multiselect(key, opciones):
+    """Quita del estado guardado los valores que ya no están en las opciones.
+
+    Necesario para filtros encadenados: al cambiar Proveedor, una Cuenta antes
+    elegida puede dejar de ser válida → si quedara en session_state, el multiselect
+    tira error. Hay que llamarlo ANTES de instanciar ese multiselect.
+    """
+    if key in st.session_state:
+        st.session_state[key] = [v for v in st.session_state[key] if v in opciones]
 
 
 def aplicar_filtros(facturas):
-    """Renderiza el panel 🔎 Segmentar / filtrar y devuelve (facturas_filtradas, hay_filtro).
+    """Renderiza el panel 🔎 Segmentar / filtrar (ENCADENADO) y devuelve
+    (facturas_filtradas, hay_filtro).
 
-    Compartido por 📊 Consultar y 📈 Dashboard (mismas keys flt_*, así el filtro
-    se mantiene al cambiar de sección)."""
+    Encadenado = al elegir Proveedor, las Cuentas se limitan a ese proveedor; al
+    elegir Cuenta, los Períodos se limitan a esa cuenta. Compartido por 📊 Consultar
+    y 📈 Dashboard (mismas keys flt_*, el filtro se mantiene al cambiar de sección).
+    """
     with st.expander("🔎 Segmentar / filtrar", expanded=False):
-        f_provs = sorted({f.get("proveedor", "") for f in facturas if f.get("proveedor")})
-        f_rubros = sorted({f.get("rubro", "") for f in facturas if f.get("rubro")})
-        f_periodos = sorted({f.get("periodo", "") for f in facturas if f.get("periodo")}, reverse=True)
-        fc1, fc2, fc3 = st.columns(3)
-        sel_prov = fc1.multiselect("Proveedor", f_provs, key="flt_prov")
-        sel_rubro = fc2.multiselect("Rubro", f_rubros, key="flt_rubro")
-        sel_periodo = fc3.multiselect("Período", f_periodos, key="flt_periodo")
-        gc1, gc2 = st.columns([3, 2])
-        sel_texto = gc1.text_input(
+        c1, c2, c3 = st.columns(3)
+
+        # 1) Proveedor
+        provs = sorted({f.get("proveedor", "") for f in facturas if f.get("proveedor")})
+        _sanear_multiselect("flt_prov", provs)
+        sel_prov = c1.multiselect("Proveedor", provs, key="flt_prov",
+                                  placeholder="Todos")
+
+        # 2) Cuenta (depende del proveedor elegido)
+        base1 = [f for f in facturas if not sel_prov or f.get("proveedor") in sel_prov]
+        cuentas = sorted({f.get("cuenta", "") for f in base1 if f.get("cuenta")})
+        _sanear_multiselect("flt_cuenta", cuentas)
+        sel_cuenta = c2.multiselect("Cuenta", cuentas, key="flt_cuenta",
+                                    placeholder="Todas",
+                                    disabled=not cuentas)
+
+        # 3) Período (depende de proveedor + cuenta) — normalizado a MM-YY
+        base2 = [f for f in base1 if not sel_cuenta or f.get("cuenta") in sel_cuenta]
+        pares = {periodo_par(f) for f in base2}
+        pares.discard(("0000-00", "s/f"))
+        periodos = [lbl for _, lbl in sorted(pares, key=lambda t: t[0], reverse=True)]
+        _sanear_multiselect("flt_periodo", periodos)
+        sel_periodo = c3.multiselect("Período", periodos, key="flt_periodo",
+                                     placeholder="Todos", disabled=not periodos)
+
+        # Segunda fila: Rubro, Estado de pago, texto
+        g1, g2 = st.columns([2, 3])
+        rubros = sorted({f.get("rubro", "") for f in base2 if f.get("rubro")})
+        _sanear_multiselect("flt_rubro", rubros)
+        sel_rubro = g1.multiselect("Rubro", rubros, key="flt_rubro",
+                                   placeholder="Todos", disabled=not rubros)
+        sel_texto = g2.text_input(
             "Buscar texto (cuenta, nº cliente, comprobante, nota)", key="flt_texto")
-        sel_estado = gc2.radio("Estado de pago", ["Todas", "Pendientes", "Pagadas"],
-                               horizontal=True, key="flt_estado")
+        sel_estado = st.radio("Estado de pago", ["Todas", "Pendientes", "Pagadas"],
+                              horizontal=True, key="flt_estado")
         if st.button("🧹 Limpiar filtros"):
-            for kk in ("flt_prov", "flt_rubro", "flt_periodo", "flt_texto", "flt_estado"):
+            for kk in ("flt_prov", "flt_cuenta", "flt_periodo", "flt_rubro",
+                       "flt_texto", "flt_estado"):
                 st.session_state.pop(kk, None)
             st.rerun()
 
     def _pasa(f):
         if sel_prov and f.get("proveedor") not in sel_prov:
             return False
-        if sel_rubro and f.get("rubro") not in sel_rubro:
+        if sel_cuenta and f.get("cuenta") not in sel_cuenta:
             return False
-        if sel_periodo and f.get("periodo") not in sel_periodo:
+        if sel_periodo and periodo_par(f)[1] not in sel_periodo:
+            return False
+        if sel_rubro and f.get("rubro") not in sel_rubro:
             return False
         if sel_estado == "Pendientes" and f.get("estado_pago") == db.ESTADO_PAGADA:
             return False
@@ -219,7 +260,8 @@ def aplicar_filtros(facturas):
         return True
 
     facturas_f = [f for f in facturas if _pasa(f)]
-    hay = bool(sel_prov or sel_rubro or sel_periodo or sel_texto or sel_estado != "Todas")
+    hay = bool(sel_prov or sel_cuenta or sel_periodo or sel_rubro or sel_texto
+               or sel_estado != "Todas")
     if hay:
         st.info(f"🔎 Filtro activo: **{len(facturas_f)}** de {len(facturas)} facturas.")
     return facturas_f, hay
@@ -739,7 +781,9 @@ elif seccion == "➕ Cargar factura":
                                      key=f"{k}_monto")
             ed_comp = st.text_input("N° de comprobante", value=fe.get("comprobante", ""),
                                     key=f"{k}_comp")
-            ed_periodo = st.text_input("Período", value=fe.get("periodo", ""), key=f"{k}_periodo")
+            ed_periodo = st.text_input("Período (MM-YY)", value=fe.get("periodo", ""),
+                                       key=f"{k}_periodo",
+                                       help="Se normaliza a MM-YY al guardar (ej. 12/2025 → 12-25).")
         ed_rubro = _input_rubro(k, fe.get("rubro", ""))
         ed_nota = st.text_input("Nota", value=fe.get("nota", ""), key=f"{k}_nota")
 
@@ -755,7 +799,9 @@ elif seccion == "➕ Cargar factura":
                 "primer_vto": fl.fmt_fecha(ed_vto) if ed_vto else "",
                 "segundo_vto": fl.fmt_fecha(ed_vto2) if ed_vto2 else "",
                 "monto": monto_val if monto_val is not None else "",
-                "periodo": ed_periodo.strip(),
+                "periodo": fl.periodo_canonico(
+                    {"periodo": ed_periodo,
+                     "primer_vto": fl.fmt_fecha(ed_vto) if ed_vto else ""}) or ed_periodo.strip(),
                 "comprobante": comp_fmt or ed_comp.strip(),
                 "rubro": ed_rubro,
                 "nota": ed_nota.strip(),
@@ -781,7 +827,8 @@ elif seccion == "➕ Cargar factura":
         # Limpiar campos de la carga anterior ANTES de instanciar los widgets
         if st.session_state.pop("cf_clear", False):
             for kk in ("cf_emision", "cf_vto", "cf_vto2", "cf_monto", "cf_comp", "cf_nota",
-                       "cf_factura_file", "cf_rubro", "cf_rubro_otro"):
+                       "cf_factura_file", "cf_rubro", "cf_rubro_otro",
+                       "cf_periodo_mes", "cf_periodo_anio", "cf_vto_prev"):
                 st.session_state.pop(kk, None)
 
         nombres_prov = sorted({p["proveedor"] for p in proveedores if p.get("proveedor")})
@@ -839,10 +886,29 @@ elif seccion == "➕ Cargar factura":
             comprobante = st.text_input("N° de comprobante *", placeholder="67 - 8878", key="cf_comp",
                                         on_change=_autoformatear_comp,
                                         help="Se guarda como 00067 - 00008878 (5 + 8 dígitos).")
-            # Período: automático y bloqueado
-            periodo_val = periodo_auto(primer_vto) if primer_vto else ""
-            st.text_input("Período (automático)", value=periodo_val, disabled=True,
-                          help="Mes anterior al 1er vencimiento. Se completa solo.")
+            # Período: desplegables Mes + Año (estandariza la carga → 'MM-YY').
+            # Por defecto = mes anterior al 1er vto; se puede ajustar a mano.
+            if primer_vto:
+                pa_y, pa_m = fl.periodo_desde_vto(primer_vto)
+            else:
+                pa_y, pa_m = date.today().year, date.today().month
+            anios_op = list(range(date.today().year - 3, date.today().year + 2))
+            if pa_y not in anios_op:
+                anios_op = sorted(set(anios_op) | {pa_y})
+            # Si cambió el vto, resetear el período sugerido (antes de instanciar los selects)
+            vto_key = fl.fmt_fecha(primer_vto) if primer_vto else ""
+            if st.session_state.get("cf_vto_prev") != vto_key:
+                st.session_state["cf_vto_prev"] = vto_key
+                st.session_state["cf_periodo_mes"] = pa_m
+                st.session_state["cf_periodo_anio"] = pa_y
+            pcol1, pcol2 = st.columns(2)
+            mes_sel = pcol1.selectbox(
+                "Período — Mes *", list(range(1, 13)),
+                format_func=lambda m: fl.MESES_ES[m - 1], key="cf_periodo_mes")
+            anio_sel = pcol2.selectbox("Período — Año *", anios_op, key="cf_periodo_anio")
+            periodo_val = fl.fmt_periodo(anio_sel, mes_sel)
+            st.caption(f"Período: **{periodo_val}**  · {fl.MESES_ES[mes_sel - 1]} {anio_sel} "
+                       "(por defecto el mes anterior al vencimiento; ajustable)")
         rubro_val = _input_rubro("cf")
         nota = st.text_input("Nota", key="cf_nota")
         archivo_factura = st.file_uploader(
@@ -873,7 +939,7 @@ elif seccion == "➕ Cargar factura":
                 st.error("El N° de comprobante debe tener dos números, ej: **67 - 8878** "
                          "(se guarda como 00057 - 00089898).")
             else:
-                periodo = periodo_auto(primer_vto)
+                periodo = periodo_val
                 factura_url = ""
                 if archivo_factura is not None:
                     try:
