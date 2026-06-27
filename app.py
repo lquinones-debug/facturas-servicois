@@ -161,6 +161,70 @@ def estado_venc(f):
     return cod, et, fl.EMOJI_ESTADO.get(cod, "⚪")
 
 
+def periodo_par(f):
+    """Devuelve (orden 'YYYY-MM', etiqueta 'MM-YY') del período de una factura.
+
+    Usa el campo `periodo` (MM-YY) si está; si no, lo deriva del 1er vencimiento.
+    """
+    p = (f.get("periodo") or "").strip()
+    m = re.match(r"(\d{1,2})-(\d{2})$", p)
+    if m:
+        return f"20{m.group(2)}-{int(m.group(1)):02d}", f"{int(m.group(1)):02d}-{m.group(2)}"
+    vto = fl.parse_fecha(f.get("primer_vto"))
+    if vto:
+        return vto.strftime("%Y-%m"), vto.strftime("%m-%y")
+    return "0000-00", "s/f"
+
+
+def aplicar_filtros(facturas):
+    """Renderiza el panel 🔎 Segmentar / filtrar y devuelve (facturas_filtradas, hay_filtro).
+
+    Compartido por 📊 Consultar y 📈 Dashboard (mismas keys flt_*, así el filtro
+    se mantiene al cambiar de sección)."""
+    with st.expander("🔎 Segmentar / filtrar", expanded=False):
+        f_provs = sorted({f.get("proveedor", "") for f in facturas if f.get("proveedor")})
+        f_rubros = sorted({f.get("rubro", "") for f in facturas if f.get("rubro")})
+        f_periodos = sorted({f.get("periodo", "") for f in facturas if f.get("periodo")}, reverse=True)
+        fc1, fc2, fc3 = st.columns(3)
+        sel_prov = fc1.multiselect("Proveedor", f_provs, key="flt_prov")
+        sel_rubro = fc2.multiselect("Rubro", f_rubros, key="flt_rubro")
+        sel_periodo = fc3.multiselect("Período", f_periodos, key="flt_periodo")
+        gc1, gc2 = st.columns([3, 2])
+        sel_texto = gc1.text_input(
+            "Buscar texto (cuenta, nº cliente, comprobante, nota)", key="flt_texto")
+        sel_estado = gc2.radio("Estado de pago", ["Todas", "Pendientes", "Pagadas"],
+                               horizontal=True, key="flt_estado")
+        if st.button("🧹 Limpiar filtros"):
+            for kk in ("flt_prov", "flt_rubro", "flt_periodo", "flt_texto", "flt_estado"):
+                st.session_state.pop(kk, None)
+            st.rerun()
+
+    def _pasa(f):
+        if sel_prov and f.get("proveedor") not in sel_prov:
+            return False
+        if sel_rubro and f.get("rubro") not in sel_rubro:
+            return False
+        if sel_periodo and f.get("periodo") not in sel_periodo:
+            return False
+        if sel_estado == "Pendientes" and f.get("estado_pago") == db.ESTADO_PAGADA:
+            return False
+        if sel_estado == "Pagadas" and f.get("estado_pago") != db.ESTADO_PAGADA:
+            return False
+        if sel_texto:
+            q = sel_texto.lower()
+            campos = [f.get(k, "") for k in
+                      ("proveedor", "cuenta", "nro_cliente", "comprobante", "nota", "periodo")]
+            if not any(q in str(v).lower() for v in campos):
+                return False
+        return True
+
+    facturas_f = [f for f in facturas if _pasa(f)]
+    hay = bool(sel_prov or sel_rubro or sel_periodo or sel_texto or sel_estado != "Todas")
+    if hay:
+        st.info(f"🔎 Filtro activo: **{len(facturas_f)}** de {len(facturas)} facturas.")
+    return facturas_f, hay
+
+
 # Rubros (categoría del gasto). Lista fija + "Otros" (texto libre). Editable.
 RUBROS = ["Agua", "Alquiler", "Expensas", "Gas", "Internet", "Luz",
           "Seguridad", "Tasa Municipal", "Telefonía", "Otros"]
@@ -281,8 +345,8 @@ def exportar_excel(facturas_list):
 st.sidebar.title("🧾 Facturas de Servicios")
 seccion = st.sidebar.radio(
     "Sección",
-    ["📊 Consultar", "📥 A descargar", "➕ Cargar factura", "💳 Pagos", "🏢 Proveedores",
-     "🗑️ Borrar / corregir"],
+    ["📊 Consultar", "📈 Dashboard", "📥 A descargar", "➕ Cargar factura", "💳 Pagos",
+     "🏢 Proveedores", "🗑️ Borrar / corregir"],
 )
 if st.sidebar.button("🔄 Actualizar datos"):
     _refrescar()
@@ -310,47 +374,7 @@ if seccion == "📊 Consultar":
     st.header("📊 Consultar facturas")
 
     # ---- Segmentación / filtros (se aplican a todas las pestañas y a la descarga) ----
-    with st.expander("🔎 Segmentar / filtrar", expanded=False):
-        f_provs = sorted({f.get("proveedor", "") for f in facturas if f.get("proveedor")})
-        f_rubros = sorted({f.get("rubro", "") for f in facturas if f.get("rubro")})
-        f_periodos = sorted({f.get("periodo", "") for f in facturas if f.get("periodo")}, reverse=True)
-        fc1, fc2, fc3 = st.columns(3)
-        sel_prov = fc1.multiselect("Proveedor", f_provs, key="flt_prov")
-        sel_rubro = fc2.multiselect("Rubro", f_rubros, key="flt_rubro")
-        sel_periodo = fc3.multiselect("Período", f_periodos, key="flt_periodo")
-        gc1, gc2 = st.columns([3, 2])
-        sel_texto = gc1.text_input(
-            "Buscar texto (cuenta, nº cliente, comprobante, nota)", key="flt_texto")
-        sel_estado = gc2.radio("Estado de pago", ["Todas", "Pendientes", "Pagadas"],
-                               horizontal=True, key="flt_estado")
-        if st.button("🧹 Limpiar filtros"):
-            for kk in ("flt_prov", "flt_rubro", "flt_periodo", "flt_texto", "flt_estado"):
-                st.session_state.pop(kk, None)
-            st.rerun()
-
-    def _pasa_filtro(f):
-        if sel_prov and f.get("proveedor") not in sel_prov:
-            return False
-        if sel_rubro and f.get("rubro") not in sel_rubro:
-            return False
-        if sel_periodo and f.get("periodo") not in sel_periodo:
-            return False
-        if sel_estado == "Pendientes" and f.get("estado_pago") == db.ESTADO_PAGADA:
-            return False
-        if sel_estado == "Pagadas" and f.get("estado_pago") != db.ESTADO_PAGADA:
-            return False
-        if sel_texto:
-            q = sel_texto.lower()
-            campos = [f.get(k, "") for k in
-                      ("proveedor", "cuenta", "nro_cliente", "comprobante", "nota", "periodo")]
-            if not any(q in str(v).lower() for v in campos):
-                return False
-        return True
-
-    facturas_f = [f for f in facturas if _pasa_filtro(f)]
-    hay_filtro = (sel_prov or sel_rubro or sel_periodo or sel_texto or sel_estado != "Todas")
-    if hay_filtro:
-        st.info(f"🔎 Filtro activo: **{len(facturas_f)}** de {len(facturas)} facturas.")
+    facturas_f, hay_filtro = aplicar_filtros(facturas)
 
     tab_pend, tab_pag, tab_hist = st.tabs(
         ["⏳ Pendientes de pago", "✅ Pagadas", "📅 Histórico por período"]
@@ -461,6 +485,99 @@ if seccion == "📊 Consultar":
         df_export(facturas_f).to_csv(index=False).encode("utf-8-sig"),
         file_name="facturas_servicios.csv", mime="text/csv",
     )
+
+
+# =============================================================================
+# DASHBOARD (gráficos interactivos)
+# =============================================================================
+elif seccion == "📈 Dashboard":
+    import plotly.express as px
+
+    st.header("📈 Dashboard")
+    st.caption("Gráficos interactivos (pasá el mouse para ver valores). Respetan el "
+               "filtro 🔎 de abajo. Tip: en cada gráfico podés hacer zoom y, con la "
+               "cámara 📷 arriba a la derecha, descargarlo como imagen.")
+
+    facturas_f, _ = aplicar_filtros(facturas)
+
+    if not facturas_f:
+        st.info("No hay datos para mostrar con el filtro actual. Probá 🧹 Limpiar filtros.")
+    else:
+        # ---- KPIs ----
+        pend = [f for f in facturas_f if f.get("estado_pago") != db.ESTADO_PAGADA]
+        pag = [f for f in facturas_f if f.get("estado_pago") == db.ESTADO_PAGADA]
+        venc = [f for f in pend if estado_venc(f)[0] == "vencida"]
+        tot_pend = sum(f.get("monto_num") or 0.0 for f in pend)
+        tot_pag = sum(f.get("monto_num") or 0.0 for f in pag)
+        tot_venc = sum(f.get("monto_num") or 0.0 for f in venc)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("💰 Pendiente", fmt_money(tot_pend))
+        k2.metric("✅ Pagado", fmt_money(tot_pag))
+        k3.metric("🔴 Vencido", fmt_money(tot_venc))
+        k4.metric("Facturas vencidas", len(venc))
+
+        # ---- DataFrame base ----
+        rows = []
+        for f in facturas_f:
+            psort, plabel = periodo_par(f)
+            rows.append({
+                "Período": plabel,
+                "_orden": psort,
+                "Proveedor": f.get("proveedor", "") or "(sin proveedor)",
+                "Rubro": f.get("rubro", "") or "(sin rubro)",
+                "Estado": "Pagada" if f.get("estado_pago") == db.ESTADO_PAGADA else "Pendiente",
+                "Monto": f.get("monto_num") or 0.0,
+            })
+        df = pd.DataFrame(rows)
+
+        COLOR_ESTADO = {"Pendiente": "#E8A33D", "Pagada": "#3DA35D"}
+
+        st.divider()
+
+        # ---- Gasto por mes ----
+        st.subheader("Gasto por período (mes)")
+        gm = (df.groupby(["Período", "_orden"], as_index=False)["Monto"].sum()
+                .sort_values("_orden"))
+        fig_mes = px.bar(gm, x="Período", y="Monto", text_auto=".2s",
+                         labels={"Monto": "Monto ($)"})
+        fig_mes.update_traces(marker_color="#4C78A8",
+                              hovertemplate="Período %{x}<br>$ %{y:,.2f}<extra></extra>")
+        fig_mes.update_layout(yaxis_tickprefix="$ ", showlegend=False, height=340,
+                              margin=dict(t=10, b=0, l=0, r=0))
+        st.plotly_chart(fig_mes, use_container_width=True)
+
+        # ---- Rubro (torta) + Proveedor (barras) ----
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Gasto por rubro")
+            gr = df.groupby("Rubro", as_index=False)["Monto"].sum().sort_values("Monto", ascending=False)
+            fig_rub = px.pie(gr, names="Rubro", values="Monto", hole=0.45)
+            fig_rub.update_traces(textposition="inside", texttemplate="%{label}<br>%{percent}",
+                                  hovertemplate="%{label}<br>$ %{value:,.2f}<extra></extra>")
+            fig_rub.update_layout(height=360, margin=dict(t=10, b=0, l=0, r=0))
+            st.plotly_chart(fig_rub, use_container_width=True)
+        with c2:
+            st.subheader("Gasto por proveedor")
+            gp = df.groupby("Proveedor", as_index=False)["Monto"].sum().sort_values("Monto")
+            fig_prov = px.bar(gp, x="Monto", y="Proveedor", orientation="h", text_auto=".2s",
+                              labels={"Monto": "Monto ($)"})
+            fig_prov.update_traces(marker_color="#72B7B2",
+                                   hovertemplate="%{y}<br>$ %{x:,.2f}<extra></extra>")
+            fig_prov.update_layout(xaxis_tickprefix="$ ", height=360,
+                                   margin=dict(t=10, b=0, l=0, r=0))
+            st.plotly_chart(fig_prov, use_container_width=True)
+
+        # ---- Pendiente vs Pagado por mes ----
+        st.subheader("Pendiente vs Pagado por período")
+        gpp = (df.groupby(["Período", "_orden", "Estado"], as_index=False)["Monto"].sum()
+                 .sort_values("_orden"))
+        fig_pp = px.bar(gpp, x="Período", y="Monto", color="Estado", barmode="group",
+                        color_discrete_map=COLOR_ESTADO, labels={"Monto": "Monto ($)"})
+        fig_pp.update_traces(hovertemplate="%{x}<br>%{fullData.name}: $ %{y:,.2f}<extra></extra>")
+        fig_pp.update_layout(yaxis_tickprefix="$ ", height=360,
+                             margin=dict(t=10, b=0, l=0, r=0),
+                             legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig_pp, use_container_width=True)
 
 
 # =============================================================================
