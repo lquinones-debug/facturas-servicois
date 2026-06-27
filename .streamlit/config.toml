@@ -1,0 +1,7 @@
+# Configuración de la app en Streamlit Cloud.
+#
+# Oculta la barra de herramientas de arriba a la derecha (menú ⋮, ícono de GitHub,
+# botón "Fork" y el lápiz de editar). Así NADIE puede forkear ni editar la app
+# desde la web. Todas las modificaciones se hacen desde VSCode + subir a GitHub.
+[client]
+toolbarMode = "minimal"
